@@ -762,6 +762,20 @@ impl Builder {
         self
     }
 
+    /// Adds a WebRTC transport for direct peer-to-peer via WebRTC DataChannels.
+    ///
+    /// The WebRTC transport uses the relay for signaling (SDP/ICE exchange)
+    /// and then establishes direct DataChannel connections between peers.
+    /// This is especially useful for browser/Wasm endpoints.
+    #[cfg(feature = "unstable-webrtc-transport")]
+    pub fn add_webrtc_transport(
+        mut self,
+        config: crate::socket::transports::webrtc::WebRtcConfig,
+    ) -> Self {
+        self.transports.push(TransportConfig::WebRtc(config));
+        self
+    }
+
     /// Sets the transport bias for a specific address kind.
     ///
     /// Transport bias controls how different transport types are prioritized during

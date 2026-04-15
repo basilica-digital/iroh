@@ -23,6 +23,9 @@ mod actor;
 pub(crate) use self::actor::Config as RelayActorConfig;
 use self::actor::{RelayActor, RelayActorMessage, RelayRecvDatagram, RelaySendItem};
 
+#[cfg(feature = "unstable-webrtc-transport")]
+pub(super) use self::actor::RelaySendItem as RelaySendItemExport;
+
 #[derive(Debug)]
 pub(crate) struct RelayTransport {
     /// Queue to receive datagrams from relays for [`noq::AsyncUdpSocket::poll_recv`].
@@ -175,6 +178,14 @@ impl RelayTransport {
         RelayNetworkChangeSender {
             sender: self.actor_sender.clone(),
         }
+    }
+
+    /// Sends a signaling datagram through the relay (used by WebRTC transport).
+    #[cfg(feature = "unstable-webrtc-transport")]
+    pub(super) fn send_signaling(&self, item: RelaySendItem) -> io::Result<()> {
+        self.relay_datagram_send_channel
+            .try_send(item)
+            .map_err(|e| io::Error::other(format!("relay send channel: {e}")))
     }
 
     /// Makes sure we have a pending item stored, if not, it'll poll a new one from the queue.
