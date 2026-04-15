@@ -21,7 +21,7 @@ use str0m::{
     net::Receive,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::socket::transports::webrtc::{
     WebRtcConfig,
@@ -184,11 +184,11 @@ impl PeerConnectionManager {
             .expect("should have pending changes from data channel creation");
         let sdp = offer.to_sdp_string();
 
-        debug!(
+        info!(
             peer = %peer_id.fmt_short(),
             session_id,
             local_addr = %local_addr,
-            "initiating WebRTC connection"
+            "initiating WebRTC connection (native offerer)"
         );
 
         let _ = self.signaling_tx.try_send(SignalingEnvelope {
@@ -261,11 +261,11 @@ impl PeerConnectionManager {
             .map_err(|e| io::Error::other(format!("failed to accept offer: {e}")))?;
         let sdp_answer = answer.to_sdp_string();
 
-        debug!(
+        info!(
             peer = %peer_id.fmt_short(),
             session_id,
             local_addr = %local_addr,
-            "accepted WebRTC offer, sending answer"
+            "accepted WebRTC offer, sending answer (native answerer)"
         );
 
         let _ = self.signaling_tx.try_send(SignalingEnvelope {
@@ -322,7 +322,7 @@ impl PeerConnectionManager {
             .accept_answer(pending, answer)
             .map_err(|e| io::Error::other(format!("failed to accept answer: {e}")))?;
 
-        debug!(
+        info!(
             peer = %peer_id.fmt_short(),
             session_id,
             "accepted WebRTC answer"
@@ -350,6 +350,12 @@ impl PeerConnectionManager {
 
         let candidate = Candidate::from_sdp_string(candidate)
             .map_err(|e| io::Error::other(format!("invalid ICE candidate: {e}")))?;
+        info!(
+            peer = %peer_id.fmt_short(),
+            session_id,
+            %candidate,
+            "adding remote ICE candidate"
+        );
         peer.rtc.add_remote_candidate(candidate);
 
         Ok(())
@@ -481,12 +487,19 @@ impl PeerConnectionManager {
             loop {
                 match peer.rtc.poll_output() {
                     Ok(Output::Transmit(transmit)) => {
+                        trace!(
+                            peer = %peer_id.fmt_short(),
+                            dst = %transmit.destination,
+                            len = transmit.contents.len(),
+                            "str0m transmit"
+                        );
                         if let Err(e) = peer
                             .socket
                             .send_to(&transmit.contents, transmit.destination)
                         {
-                            trace!(
+                            warn!(
                                 peer = %peer_id.fmt_short(),
+                                dst = %transmit.destination,
                                 "UDP send error: {e}"
                             );
                         }
@@ -516,7 +529,7 @@ impl PeerConnectionManager {
     fn handle_event(&mut self, peer_id: EndpointId, event: Event) {
         match event {
             Event::IceConnectionStateChange(state) => {
-                debug!(
+                info!(
                     peer = %peer_id.fmt_short(),
                     ?state,
                     "ICE connection state changed"
@@ -537,7 +550,7 @@ impl PeerConnectionManager {
                 }
             }
             Event::ChannelOpen(channel_id, label) => {
-                debug!(
+                info!(
                     peer = %peer_id.fmt_short(),
                     %label,
                     "DataChannel opened"

@@ -520,6 +520,10 @@ impl Transports {
                 // This is a signaling datagram — extract and forward to WebRTC
                 if let Some(msg) = webrtc::signaling::decode(data) {
                     if let Addr::Relay(_, peer_id) = &self.source_addrs[read_idx] {
+                        trace!(
+                            peer = %peer_id.fmt_short(),
+                            "intercepted WebRTC signaling from relay"
+                        );
                         let envelope = webrtc::signaling::SignalingEnvelope {
                             peer: *peer_id,
                             msg,
@@ -559,9 +563,20 @@ impl Transports {
         };
 
         while let Poll::Ready(Some(envelope)) = signaling.outgoing_rx.poll_recv(cx) {
+            trace!(
+                peer = %envelope.peer.fmt_short(),
+                msg_type = %match &envelope.msg {
+                    webrtc::signaling::SignalingMsg::Offer { .. } => "offer",
+                    webrtc::signaling::SignalingMsg::Answer { .. } => "answer",
+                    webrtc::signaling::SignalingMsg::IceCandidate { .. } => "ice-candidate",
+                    webrtc::signaling::SignalingMsg::Close { .. } => "close",
+                },
+                "forwarding WebRTC signaling via relay"
+            );
             let payload = webrtc::signaling::encode(&envelope.msg);
 
             // Send through the first available relay transport
+            let mut sent = false;
             for relay_transport in &self.relay {
                 let home_relay = relay_transport.local_addr_watch().get();
                 if let Some((relay_url, _)) = home_relay {
@@ -572,9 +587,17 @@ impl Transports {
                     };
                     if let Err(e) = relay_transport.send_signaling(send_item) {
                         warn!("failed to send WebRTC signaling via relay: {e}");
+                    } else {
+                        sent = true;
                     }
                     break;
                 }
+            }
+            if !sent {
+                warn!(
+                    peer = %envelope.peer.fmt_short(),
+                    "no relay transport available for WebRTC signaling"
+                );
             }
         }
     }

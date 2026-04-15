@@ -31,7 +31,7 @@ use bytes::Bytes;
 use iroh_base::{CustomAddr, EndpointId, SecretKey};
 use n0_watcher::Watchable;
 use tokio::sync::mpsc;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use self::{
     peer_connection::PeerConnectionManager,
@@ -177,10 +177,10 @@ impl WebRtcEndpoint {
             let mut mgr = self.peer_mgr.lock().expect("poisoned");
             match &envelope.msg {
                 SignalingMsg::Offer { session_id, sdp } => {
-                    debug!(
+                    info!(
                         peer = %envelope.peer.fmt_short(),
                         session_id,
-                        "received WebRTC offer"
+                        "received WebRTC offer via signaling"
                     );
                     if let Err(e) = mgr.handle_offer(envelope.peer, *session_id, sdp) {
                         warn!(
@@ -190,10 +190,10 @@ impl WebRtcEndpoint {
                     }
                 }
                 SignalingMsg::Answer { session_id, sdp } => {
-                    debug!(
+                    info!(
                         peer = %envelope.peer.fmt_short(),
                         session_id,
-                        "received WebRTC answer"
+                        "received WebRTC answer via signaling"
                     );
                     if let Err(e) = mgr.handle_answer(envelope.peer, *session_id, sdp) {
                         warn!(
@@ -207,10 +207,11 @@ impl WebRtcEndpoint {
                     candidate,
                     sdp_mid,
                 } => {
-                    trace!(
+                    info!(
                         peer = %envelope.peer.fmt_short(),
                         session_id,
-                        "received ICE candidate"
+                        %candidate,
+                        "received ICE candidate via signaling"
                     );
                     if let Err(e) = mgr.handle_ice_candidate(
                         envelope.peer,
@@ -320,6 +321,11 @@ impl CustomSender for WebRtcSender {
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
         let peer_id = parse_endpoint_id(dst)?;
+        trace!(
+            peer = %peer_id.fmt_short(),
+            len = transmit.contents.len(),
+            "WebRTC poll_send"
+        );
         let mut mgr = self.peer_mgr.lock().expect("poisoned");
 
         // Split into individual datagrams if GSO segments are present
