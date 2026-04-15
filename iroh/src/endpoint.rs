@@ -1246,14 +1246,18 @@ impl Endpoint {
     /// task once the endpoint stops combine with [`Self::closed`].
     #[cfg(wasm_browser)]
     pub fn watch_addr(&self) -> impl n0_watcher::Watcher<Value = EndpointAddr> + use<> {
-        // In browsers, there will never be any direct addresses, so we wait
-        // for the home relay instead. This makes the `EndpointAddr` have *some* way
-        // of connecting to us.
+        // In browsers, there are no direct IP addresses, but there may be custom
+        // transport addresses (e.g. WebRTC). Include relay and custom addresses.
         let watch_relay = self.inner.home_relay();
+        let watch_custom = self.inner.custom_addrs();
         let endpoint_id = self.id();
-        watch_relay.map(move |mut relays| {
-            EndpointAddr::from_parts(endpoint_id, relays.into_iter().map(TransportAddr::Relay))
-        })
+        watch_relay
+            .or(watch_custom)
+            .map(move |(relays, custom)| {
+                let relay_addrs = relays.into_iter().map(TransportAddr::Relay);
+                let custom_addrs = custom.into_iter().map(TransportAddr::Custom);
+                EndpointAddr::from_parts(endpoint_id, relay_addrs.chain(custom_addrs))
+            })
     }
 
     /// A convenience method that waits for the endpoint to be considered "online".

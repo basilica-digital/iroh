@@ -443,6 +443,24 @@ impl Socket {
         self.direct_addrs.addrs.watch()
     }
 
+    /// Watch for changes to custom transport addresses (e.g. WebRTC).
+    pub(crate) fn custom_addrs(
+        &self,
+    ) -> impl n0_watcher::Watcher<Value = Vec<iroh_base::CustomAddr>> + use<> {
+        self.local_addrs_watch.clone().map(|addrs| {
+            addrs
+                .into_iter()
+                .filter_map(|addr| {
+                    if let transports::Addr::Custom(custom) = addr {
+                        Some(custom)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+    }
+
     /// Returns a [`Watcher`] for this socket's net-report.
     ///
     /// The [`Socket`] continuously monitors the network conditions for changes.
