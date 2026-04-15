@@ -6096,6 +6096,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "webrtc-browser-example"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "getrandom 0.4.2",
+ "iroh",
+ "js-sys",
+ "n0-error",
+ "n0-future",
+ "serde_json",
+ "time",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-tracing",
+ "web-sys",
+]
+
+[[package]]
 name = "whoami"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

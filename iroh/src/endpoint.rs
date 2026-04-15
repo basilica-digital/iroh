@@ -31,6 +31,12 @@ pub mod transports {
     #[cfg(feature = "unstable-custom-transports")]
     pub use super::socket::transports::custom::{CustomEndpoint, CustomSender, CustomTransport};
     pub use super::socket::transports::{Addr, AddrKind, Transmit, TransportBias};
+
+    /// WebRTC transport types for direct P2P via DataChannels.
+    #[cfg(feature = "unstable-webrtc-transport")]
+    pub mod webrtc {
+        pub use crate::socket::transports::webrtc::{IceServer, WebRtcConfig, WebRtcTransport};
+    }
 }
 
 use self::hooks::EndpointHooksList;
