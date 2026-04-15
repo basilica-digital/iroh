@@ -24,6 +24,9 @@ const ALPN: &[u8] = b"iroh-example/webrtc-chat/0";
 /// Global endpoint, initialized once.
 static ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
 
+/// Global outgoing connection, set by `connect()`.
+static CONN: OnceLock<Connection> = OnceLock::new();
+
 /// Append a line to the `#log` textarea in the page.
 fn log(msg: &str) {
     info!("{msg}");
@@ -167,12 +170,13 @@ async fn handle_connection(conn: Connection) -> Result<(), String> {
     }
 }
 
-/// Connect to a remote peer and send a message.
+/// Connect to a remote peer and keep the connection open.
 ///
 /// `addr_json` is the JSON-serialized `EndpointAddr` from the other browser tab.
-/// `message` is the text to send.
+/// The connection is stored globally so subsequent `send_message` calls reuse it.
+/// This gives WebRTC signaling time to complete and establish a direct path.
 #[wasm_bindgen]
-pub async fn send_message(addr_json: &str, message: &str) -> Result<String, JsValue> {
+pub async fn connect(addr_json: &str) -> Result<(), JsValue> {
     let endpoint = ENDPOINT
         .get()
         .ok_or_else(|| JsValue::from_str("endpoint not initialized — call init() first"))?;
@@ -188,10 +192,25 @@ pub async fn send_message(addr_json: &str, message: &str) -> Result<String, JsVa
         .map_err(|e| JsValue::from_str(&format!("connect failed: {e}")))?;
 
     log(&format!(
-        "Connected to {}! Sending message...",
+        "Connected to {}!",
         conn.remote_id().fmt_short()
     ));
     log_paths(&conn);
+
+    CONN.set(conn)
+        .map_err(|_| JsValue::from_str("already connected — reload to reconnect"))?;
+
+    Ok(())
+}
+
+/// Send a message over the existing connection.
+///
+/// Must call `connect()` first to establish the connection.
+#[wasm_bindgen]
+pub async fn send_message(message: &str) -> Result<String, JsValue> {
+    let conn = CONN
+        .get()
+        .ok_or_else(|| JsValue::from_str("not connected — call connect() first"))?;
 
     let (mut send, mut recv) = conn
         .open_bi()
@@ -214,7 +233,8 @@ pub async fn send_message(addr_json: &str, message: &str) -> Result<String, JsVa
 
     log(&format!("< {reply}"));
 
-    conn.close(0u32.into(), b"done");
+    // Log paths so we can see if WebRTC has kicked in.
+    log_paths(conn);
 
     Ok(reply)
 }

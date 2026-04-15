@@ -55,6 +55,7 @@
         }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
         #btn-init { background: #7c83ff; color: #fff; }
+        #btn-connect { background: #e8a838; color: #fff; }
         #btn-send { background: #53c28b; color: #fff; }
         #btn-copy { background: #444; color: #fff; }
         .addr-display {
@@ -95,10 +96,15 @@
     </div>
 
     <div class="section">
-        <h2>2. Connect &amp; Send</h2>
+        <h2>2. Connect to Peer</h2>
         <label>Peer Address (paste from the other tab)</label>
         <textarea id="peer-addr" placeholder="Paste the JSON address from the other browser tab here..."></textarea>
-        <div class="row" style="margin-top: 0.5rem;">
+        <button id="btn-connect" disabled>Connect</button>
+    </div>
+
+    <div class="section">
+        <h2>3. Send Messages</h2>
+        <div class="row">
             <input type="text" id="message" placeholder="Type a message..." value="Hello from browser!">
             <button id="btn-send" disabled>Send</button>
         </div>
@@ -117,13 +123,12 @@
             <li>Open two browser tabs at <code>http://127.0.0.1:8080</code></li>
             <li>Click "Initialize" in both tabs and wait for "Online!"</li>
             <li>Copy the address from Tab A and paste into Tab B's "Peer Address" (and vice versa)</li>
-            <li>Type a message and click "Send" &mdash; it will be echoed back</li>
+            <li>Click "Connect" to establish a persistent connection</li>
+            <li>Type messages and click "Send" &mdash; watch the paths: WebRTC should appear after a few seconds</li>
         </ol>
     </div>
 
     <script>
-        // Trunk fires this event after the wasm module is loaded and initialized.
-        // Named exports are available on window.wasmBindings.
         let myAddr = null;
 
         function appendLog(msg) {
@@ -147,7 +152,7 @@
                     myAddr = addrJson;
                     document.getElementById('my-addr').textContent = addrJson;
                     document.getElementById('btn-copy').disabled = false;
-                    document.getElementById('btn-send').disabled = false;
+                    document.getElementById('btn-connect').disabled = false;
                     btnInit.textContent = 'Running';
                 } catch (e) {
                     appendLog('Init failed: ' + e);
@@ -166,10 +171,27 @@
                 }
             });
 
-            document.getElementById('btn-send').addEventListener('click', async () => {
+            document.getElementById('btn-connect').addEventListener('click', async () => {
                 const peerAddr = document.getElementById('peer-addr').value.trim();
-                const message = document.getElementById('message').value.trim();
                 if (!peerAddr) { appendLog('Please paste a peer address first'); return; }
+
+                const btn = document.getElementById('btn-connect');
+                btn.disabled = true;
+                btn.textContent = 'Connecting...';
+
+                try {
+                    await wasm.connect(peerAddr);
+                    btn.textContent = 'Connected';
+                    document.getElementById('btn-send').disabled = false;
+                } catch (e) {
+                    appendLog('Connect failed: ' + e);
+                    btn.disabled = false;
+                    btn.textContent = 'Retry';
+                }
+            });
+
+            document.getElementById('btn-send').addEventListener('click', async () => {
+                const message = document.getElementById('message').value.trim();
                 if (!message) { appendLog('Please type a message'); return; }
 
                 const btn = document.getElementById('btn-send');
@@ -177,7 +199,7 @@
                 btn.textContent = 'Sending...';
 
                 try {
-                    const reply = await wasm.send_message(peerAddr, message);
+                    const reply = await wasm.send_message(message);
                     appendLog('Reply: ' + reply);
                 } catch (e) {
                     appendLog('Send failed: ' + e);
