@@ -123,8 +123,12 @@ impl PeerConnectionManager {
     }
 
     /// Binds a new UDP socket for a peer connection.
+    ///
+    /// Uses `127.0.0.1:0` so the local address is a valid host candidate for str0m.
+    // TODO: For LAN/direct connectivity, discover real interface addresses
+    // and add each as a host candidate. For NAT traversal, integrate STUN.
     fn bind_socket() -> io::Result<UdpSocket> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        let socket = UdpSocket::bind("127.0.0.1:0")?;
         socket.set_nonblocking(true)?;
         Ok(socket)
     }
@@ -148,8 +152,10 @@ impl PeerConnectionManager {
 
         let mut rtc = self.create_rtc();
 
-        // Add our local socket as an ICE candidate
-        rtc.add_local_candidate(Candidate::host(local_addr, "udp").expect("valid candidate"));
+        // Add our local socket as an ICE host candidate
+        if let Ok(candidate) = Candidate::host(local_addr, "udp") {
+            rtc.add_local_candidate(candidate);
+        }
 
         // Create DataChannel (as offerer) and generate SDP offer
         let mut changes = rtc.sdp_api();
@@ -227,8 +233,10 @@ impl PeerConnectionManager {
 
         let mut rtc = self.create_rtc();
 
-        // Add our local socket as an ICE candidate
-        rtc.add_local_candidate(Candidate::host(local_addr, "udp").expect("valid candidate"));
+        // Add our local socket as an ICE host candidate
+        if let Ok(candidate) = Candidate::host(local_addr, "udp") {
+            rtc.add_local_candidate(candidate);
+        }
 
         // Accept the remote offer
         let offer = SdpOffer::from_sdp_string(sdp)
