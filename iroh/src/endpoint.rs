@@ -1221,17 +1221,21 @@ impl Endpoint {
     pub fn watch_addr(&self) -> impl n0_watcher::Watcher<Value = EndpointAddr> + use<> {
         let watch_addrs = self.inner.ip_addrs();
         let watch_relay = self.inner.home_relay();
+        let watch_custom = self.inner.custom_addrs();
         let endpoint_id = self.id();
 
-        watch_addrs.or(watch_relay).map(move |(addrs, relays)| {
-            EndpointAddr::from_parts(
-                endpoint_id,
-                relays
-                    .into_iter()
-                    .map(TransportAddr::Relay)
-                    .chain(addrs.into_iter().map(|x| TransportAddr::Ip(x.addr))),
-            )
-        })
+        watch_addrs
+            .or(watch_relay)
+            .or(watch_custom)
+            .map(move |((addrs, relays), custom)| {
+                let ip_addrs = addrs.into_iter().map(|x| TransportAddr::Ip(x.addr));
+                let relay_addrs = relays.into_iter().map(TransportAddr::Relay);
+                let custom_addrs = custom.into_iter().map(TransportAddr::Custom);
+                EndpointAddr::from_parts(
+                    endpoint_id,
+                    relay_addrs.chain(ip_addrs).chain(custom_addrs),
+                )
+            })
     }
 
     /// Returns a [`Watcher`] for the current [`EndpointAddr`] for this endpoint.
