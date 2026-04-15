@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>iroh WebRTC Browser Chat</title>
+    <link data-trunk rel="rust" data-wasm-opt="z" data-initializer="initializer.js" />
+    <link data-trunk rel="copy-file" href="initializer.js" />
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -85,21 +87,21 @@
 
     <div class="section">
         <h2>1. Start Endpoint</h2>
-        <button id="btn-init" onclick="doInit()">Initialize</button>
+        <button id="btn-init">Initialize</button>
         <div style="margin-top: 0.5rem;">
             <label>Your Address (share this with the other tab)</label>
-            <div class="addr-display" id="my-addr">Not started</div>
-            <button id="btn-copy" onclick="copyAddr()" disabled>Copy Address</button>
+            <div class="addr-display" id="my-addr">Loading wasm...</div>
+            <button id="btn-copy" disabled>Copy Address</button>
         </div>
     </div>
 
     <div class="section">
-        <h2>2. Connect & Send</h2>
+        <h2>2. Connect &amp; Send</h2>
         <label>Peer Address (paste from the other tab)</label>
-        <textarea id="peer-addr" placeholder='Paste the JSON address from the other browser tab here...'></textarea>
+        <textarea id="peer-addr" placeholder="Paste the JSON address from the other browser tab here..."></textarea>
         <div class="row" style="margin-top: 0.5rem;">
             <input type="text" id="message" placeholder="Type a message..." value="Hello from browser!">
-            <button id="btn-send" onclick="doSend()" disabled>Send</button>
+            <button id="btn-send" disabled>Send</button>
         </div>
     </div>
 
@@ -111,77 +113,90 @@
     <div class="instructions">
         <h2>How to use</h2>
         <ol>
-            <li>Build with: <code>wasm-pack build --target web iroh/examples/webrtc-browser</code></li>
-            <li>Serve this directory: <code>python3 -m http.server 8080 -d iroh/examples/webrtc-browser</code></li>
-            <li>Open two browser tabs pointing to <code>http://localhost:8080</code></li>
+            <li>Install Trunk: <code>cargo install trunk</code></li>
+            <li>From this directory: <code>trunk serve</code></li>
+            <li>Open two browser tabs at <code>http://127.0.0.1:8080</code></li>
             <li>Click "Initialize" in both tabs and wait for "Online!"</li>
-            <li>Copy the address from Tab A and paste it into Tab B's "Peer Address" field (and vice versa)</li>
+            <li>Copy the address from Tab A and paste into Tab B's "Peer Address" (and vice versa)</li>
             <li>Type a message and click "Send" &mdash; it will be echoed back</li>
         </ol>
     </div>
 
-    <script type="module">
-        import init_wasm, { init, send_message, get_addr } from './pkg/webrtc_browser_example.js';
-
-        // Make functions available globally for onclick handlers
+    <script>
+        // Wait for Trunk to initialize the wasm module.
+        // The initializer.js stores exports on window.__wasm.
         let myAddr = null;
 
-        window.doInit = async function() {
-            const btn = document.getElementById('btn-init');
-            btn.disabled = true;
-            btn.textContent = 'Starting...';
-
-            try {
-                await init_wasm();
-                const addrJson = await init();
-                myAddr = addrJson;
-                document.getElementById('my-addr').textContent = addrJson;
-                document.getElementById('btn-copy').disabled = false;
-                document.getElementById('btn-send').disabled = false;
-                btn.textContent = 'Running';
-            } catch (e) {
-                appendLog('Init failed: ' + e);
-                btn.disabled = false;
-                btn.textContent = 'Retry';
-            }
-        };
-
-        window.copyAddr = function() {
-            if (myAddr) {
-                navigator.clipboard.writeText(myAddr).then(() => {
-                    const btn = document.getElementById('btn-copy');
-                    btn.textContent = 'Copied!';
-                    setTimeout(() => btn.textContent = 'Copy Address', 1500);
-                });
-            }
-        };
-
-        window.doSend = async function() {
-            const peerAddr = document.getElementById('peer-addr').value.trim();
-            const message = document.getElementById('message').value.trim();
-            if (!peerAddr) { appendLog('Please paste a peer address first'); return; }
-            if (!message) { appendLog('Please type a message'); return; }
-
-            const btn = document.getElementById('btn-send');
-            btn.disabled = true;
-            btn.textContent = 'Sending...';
-
-            try {
-                const reply = await send_message(peerAddr, message);
-                appendLog('Reply: ' + reply);
-            } catch (e) {
-                appendLog('Send failed: ' + e);
-            } finally {
-                btn.disabled = false;
-                btn.textContent = 'Send';
-            }
-        };
+        function waitForWasm() {
+            return new Promise(resolve => {
+                if (window.__wasm) return resolve(window.__wasm);
+                const check = () => {
+                    if (window.__wasm) resolve(window.__wasm);
+                    else requestAnimationFrame(check);
+                };
+                check();
+            });
+        }
 
         function appendLog(msg) {
             const log = document.getElementById('log');
             log.value += (log.value ? '\n' : '') + msg;
             log.scrollTop = log.scrollHeight;
         }
+
+        waitForWasm().then(wasm => {
+            document.getElementById('my-addr').textContent = 'Not started';
+
+            document.getElementById('btn-init').addEventListener('click', async () => {
+                const btn = document.getElementById('btn-init');
+                btn.disabled = true;
+                btn.textContent = 'Starting...';
+
+                try {
+                    const addrJson = await wasm.init();
+                    myAddr = addrJson;
+                    document.getElementById('my-addr').textContent = addrJson;
+                    document.getElementById('btn-copy').disabled = false;
+                    document.getElementById('btn-send').disabled = false;
+                    btn.textContent = 'Running';
+                } catch (e) {
+                    appendLog('Init failed: ' + e);
+                    btn.disabled = false;
+                    btn.textContent = 'Retry';
+                }
+            });
+
+            document.getElementById('btn-copy').addEventListener('click', () => {
+                if (myAddr) {
+                    navigator.clipboard.writeText(myAddr).then(() => {
+                        const btn = document.getElementById('btn-copy');
+                        btn.textContent = 'Copied!';
+                        setTimeout(() => btn.textContent = 'Copy Address', 1500);
+                    });
+                }
+            });
+
+            document.getElementById('btn-send').addEventListener('click', async () => {
+                const peerAddr = document.getElementById('peer-addr').value.trim();
+                const message = document.getElementById('message').value.trim();
+                if (!peerAddr) { appendLog('Please paste a peer address first'); return; }
+                if (!message) { appendLog('Please type a message'); return; }
+
+                const btn = document.getElementById('btn-send');
+                btn.disabled = true;
+                btn.textContent = 'Sending...';
+
+                try {
+                    const reply = await wasm.send_message(peerAddr, message);
+                    appendLog('Reply: ' + reply);
+                } catch (e) {
+                    appendLog('Send failed: ' + e);
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = 'Send';
+                }
+            });
+        });
     </script>
 </body>
 </html>

@@ -1,13 +1,13 @@
 //! Browser-to-browser WebRTC example for iroh.
 //!
-//! Build with:
+//! Build and serve with [Trunk](https://trunkrs.dev/):
 //!
 //! ```sh
-//! wasm-pack build --target web iroh/examples/webrtc-browser
+//! cd iroh/examples/webrtc-browser
+//! trunk serve
 //! ```
 //!
-//! Then serve the `iroh/examples/webrtc-browser/` directory with any static HTTP server
-//! and open `index.html` in two browser tabs.
+//! Then open two browser tabs at <http://localhost:8080>.
 
 use std::sync::OnceLock;
 
@@ -42,7 +42,6 @@ fn log(msg: &str) {
         format!("{prev}\n{msg}")
     };
     ta.set_value(&next);
-    // Auto-scroll to bottom
     ta.set_scroll_top(ta.scroll_height());
 }
 
@@ -70,19 +69,15 @@ pub async fn init() -> Result<String, JsValue> {
     log(&format!("Endpoint ID: {}", endpoint.id().fmt_short()));
     log("Waiting for relay connection...");
 
-    // Wait for the endpoint to be online (connected to relay)
-    n0_future::time::timeout(
-        std::time::Duration::from_secs(15),
-        endpoint.online(),
-    )
-    .await
-    .map_err(|_| JsValue::from_str("timeout waiting for relay connection"))?;
+    n0_future::time::timeout(std::time::Duration::from_secs(15), endpoint.online())
+        .await
+        .map_err(|_| JsValue::from_str("timeout waiting for relay connection"))?;
 
     let addr = endpoint.addr();
     let addr_json = serde_json::to_string(&addr)
         .map_err(|e| JsValue::from_str(&format!("serialize addr: {e}")))?;
 
-    log(&format!("Online! Relay connected."));
+    log("Online! Relay connected.");
     log(&format!("Address: {addr_json}"));
 
     // Spawn background task to accept incoming connections
@@ -135,7 +130,6 @@ async fn handle_connection(conn: iroh::endpoint::Connection) -> Result<(), Strin
         let msg = String::from_utf8_lossy(&data);
         log(&format!("< {msg}"));
 
-        // Echo back with a prefix
         let reply = format!("echo: {msg}");
         send.write_all(reply.as_bytes())
             .await
@@ -157,10 +151,7 @@ pub async fn send_message(addr_json: &str, message: &str) -> Result<String, JsVa
     let addr: EndpointAddr = serde_json::from_str(addr_json)
         .map_err(|e| JsValue::from_str(&format!("invalid address JSON: {e}")))?;
 
-    log(&format!(
-        "Connecting to {}...",
-        addr.id.fmt_short()
-    ));
+    log(&format!("Connecting to {}...", addr.id.fmt_short()));
 
     let conn = endpoint
         .connect(addr, ALPN)
@@ -199,9 +190,6 @@ pub async fn send_message(addr_json: &str, message: &str) -> Result<String, JsVa
 }
 
 /// Get the current endpoint address as JSON.
-///
-/// Useful to re-read the address after the endpoint has been running
-/// and may have discovered new addresses.
 #[wasm_bindgen]
 pub fn get_addr() -> Result<String, JsValue> {
     let endpoint = ENDPOINT
