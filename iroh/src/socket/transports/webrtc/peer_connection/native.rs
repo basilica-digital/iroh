@@ -821,4 +821,70 @@ mod tests {
         // Should be a different session
         assert_ne!(session_1, session_2);
     }
+
+    /// Verifies str0m can parse ICE candidate strings in browser format.
+    ///
+    /// Browsers return candidates from `RTCIceCandidate.candidate` in a
+    /// specific format (with "candidate:" prefix, possibly with extensions
+    /// like "generation" and "network-cost"). str0m must parse these for
+    /// cross-platform ICE to work.
+    #[test]
+    fn test_parse_browser_ice_candidates() {
+        // Typical browser host candidate
+        let host = "candidate:842163049 1 udp 2122260223 192.168.1.100 54321 typ host generation 0 ufrag 1234 network-id 1 network-cost 10";
+        let result = Candidate::from_sdp_string(host);
+        assert!(result.is_ok(), "Failed to parse browser host candidate: {result:?}");
+
+        // Browser SRFLX candidate (via STUN)
+        let srflx = "candidate:842163049 1 udp 1677729535 203.0.113.5 54321 typ srflx raddr 192.168.1.100 rport 12345 generation 0 ufrag 1234 network-id 1";
+        let result = Candidate::from_sdp_string(srflx);
+        assert!(result.is_ok(), "Failed to parse browser srflx candidate: {result:?}");
+
+        // Minimal candidate (no extensions)
+        let minimal = "candidate:1 1 udp 2130706175 10.0.0.1 5000 typ host";
+        let result = Candidate::from_sdp_string(minimal);
+        assert!(result.is_ok(), "Failed to parse minimal candidate: {result:?}");
+    }
+
+    /// Verifies that str0m includes the host candidate in the SDP offer,
+    /// which is needed for browsers to learn the native peer's ICE candidate.
+    #[test]
+    fn test_sdp_contains_host_candidate() {
+        let key = SecretKey::generate();
+        let id = key.public();
+
+        let (sig_tx, mut sig_rx) = mpsc::channel(64);
+        let (dgram_tx, _) = mpsc::channel(64);
+        let mut mgr = PeerConnectionManager::new(id, WebRtcConfig::default(), sig_tx, dgram_tx);
+
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let peer_key = SecretKey::generate();
+        let peer_id = peer_key.public();
+
+        // Trigger initiate to generate an offer
+        let _ = mgr.send(&mut cx, peer_id, b"test");
+
+        let envelope = sig_rx.try_recv().expect("should have offer");
+        let sdp = match &envelope.msg {
+            SignalingMsg::Offer { sdp, .. } => sdp,
+            other => panic!("expected Offer, got {other:?}"),
+        };
+
+        // The SDP must contain at least one candidate line
+        assert!(
+            sdp.contains("a=candidate:"),
+            "SDP offer must include host candidate line(s).\nSDP:\n{sdp}"
+        );
+
+        // The candidate should be a UDP host candidate, not loopback
+        let default_ip = PeerConnectionManager::default_local_ip();
+        if let Some(ip) = default_ip {
+            assert!(
+                sdp.contains(&ip.to_string()),
+                "SDP must include the default IP ({ip}).\nSDP:\n{sdp}"
+            );
+        }
+    }
 }
