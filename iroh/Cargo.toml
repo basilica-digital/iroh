@@ -252,3 +252,7 @@ required-features = []
 [[example]]
 name = "incoming-filter"
 required-features = []
+
+[[example]]
+name = "webrtc-native"
+required-features = ["unstable-webrtc-transport"]
