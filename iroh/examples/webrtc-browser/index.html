@@ -4,8 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>iroh WebRTC Browser Chat</title>
-    <link data-trunk rel="rust" data-wasm-opt="z" data-initializer="initializer.js" />
-    <link data-trunk rel="copy-file" href="initializer.js" />
+    <link data-trunk rel="rust" data-wasm-opt="z" />
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -87,10 +86,10 @@
 
     <div class="section">
         <h2>1. Start Endpoint</h2>
-        <button id="btn-init">Initialize</button>
+        <button id="btn-init" disabled>Loading wasm...</button>
         <div style="margin-top: 0.5rem;">
             <label>Your Address (share this with the other tab)</label>
-            <div class="addr-display" id="my-addr">Loading wasm...</div>
+            <div class="addr-display" id="my-addr">Not started</div>
             <button id="btn-copy" disabled>Copy Address</button>
         </div>
     </div>
@@ -123,20 +122,9 @@
     </div>
 
     <script>
-        // Wait for Trunk to initialize the wasm module.
-        // The initializer.js stores exports on window.__wasm.
+        // Trunk fires this event after the wasm module is loaded and initialized.
+        // Named exports are available on window.wasmBindings.
         let myAddr = null;
-
-        function waitForWasm() {
-            return new Promise(resolve => {
-                if (window.__wasm) return resolve(window.__wasm);
-                const check = () => {
-                    if (window.__wasm) resolve(window.__wasm);
-                    else requestAnimationFrame(check);
-                };
-                check();
-            });
-        }
 
         function appendLog(msg) {
             const log = document.getElementById('log');
@@ -144,13 +132,15 @@
             log.scrollTop = log.scrollHeight;
         }
 
-        waitForWasm().then(wasm => {
-            document.getElementById('my-addr').textContent = 'Not started';
+        window.addEventListener('TrunkApplicationStarted', () => {
+            const wasm = window.wasmBindings;
+            const btnInit = document.getElementById('btn-init');
+            btnInit.disabled = false;
+            btnInit.textContent = 'Initialize';
 
-            document.getElementById('btn-init').addEventListener('click', async () => {
-                const btn = document.getElementById('btn-init');
-                btn.disabled = true;
-                btn.textContent = 'Starting...';
+            btnInit.addEventListener('click', async () => {
+                btnInit.disabled = true;
+                btnInit.textContent = 'Starting...';
 
                 try {
                     const addrJson = await wasm.init();
@@ -158,11 +148,11 @@
                     document.getElementById('my-addr').textContent = addrJson;
                     document.getElementById('btn-copy').disabled = false;
                     document.getElementById('btn-send').disabled = false;
-                    btn.textContent = 'Running';
+                    btnInit.textContent = 'Running';
                 } catch (e) {
                     appendLog('Init failed: ' + e);
-                    btn.disabled = false;
-                    btn.textContent = 'Retry';
+                    btnInit.disabled = false;
+                    btnInit.textContent = 'Retry';
                 }
             });
 
