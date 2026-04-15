@@ -124,13 +124,27 @@ impl PeerConnectionManager {
 
     /// Binds a new UDP socket for a peer connection.
     ///
-    /// Uses `127.0.0.1:0` so the local address is a valid host candidate for str0m.
-    // TODO: For LAN/direct connectivity, discover real interface addresses
-    // and add each as a host candidate. For NAT traversal, integrate STUN.
+    /// Binds to the default outgoing interface address so that:
+    /// - `socket.local_addr()` returns a real IP (needed by str0m ICE)
+    /// - The socket can send/receive to remote peers (not just loopback)
+    ///
+    /// Falls back to `127.0.0.1` if no default route is available.
     fn bind_socket() -> io::Result<UdpSocket> {
-        let socket = UdpSocket::bind("127.0.0.1:0")?;
+        let bind_ip = Self::default_local_ip()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let socket = UdpSocket::bind(std::net::SocketAddr::new(bind_ip, 0))?;
         socket.set_nonblocking(true)?;
         Ok(socket)
+    }
+
+    /// Discovers the default outgoing IP address using the UDP "connect trick".
+    ///
+    /// Connecting a UDP socket to an external address (without sending data)
+    /// lets the OS pick the outgoing interface, which we read back.
+    fn default_local_ip() -> Option<std::net::IpAddr> {
+        let probe = UdpSocket::bind("0.0.0.0:0").ok()?;
+        probe.connect("8.8.8.8:80").ok()?;
+        probe.local_addr().ok().map(|a| a.ip())
     }
 
     /// Generates a unique session ID.
