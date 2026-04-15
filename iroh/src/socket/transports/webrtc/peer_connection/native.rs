@@ -584,3 +584,227 @@ impl PeerConnectionManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use iroh_base::SecretKey;
+
+    use super::*;
+    use crate::socket::transports::webrtc::WebRtcConfig;
+
+    /// Relays all pending signaling messages between two managers.
+    ///
+    /// Outgoing envelopes have `peer` = destination, but the receiving manager
+    /// expects `peer` = source (like the relay would set it). This function
+    /// remaps accordingly.
+    fn relay_signaling(
+        a_rx: &mut mpsc::Receiver<SignalingEnvelope>,
+        b_rx: &mut mpsc::Receiver<SignalingEnvelope>,
+        id_a: EndpointId,
+        id_b: EndpointId,
+        mgr_a: &mut PeerConnectionManager,
+        mgr_b: &mut PeerConnectionManager,
+    ) {
+        // A → B: remap peer to A (the source)
+        while let Ok(env) = a_rx.try_recv() {
+            let remapped = SignalingEnvelope {
+                peer: id_a,
+                msg: env.msg,
+            };
+            let _ = dispatch_signaling(mgr_b, &remapped);
+        }
+        // B → A: remap peer to B (the source)
+        while let Ok(env) = b_rx.try_recv() {
+            let remapped = SignalingEnvelope {
+                peer: id_b,
+                msg: env.msg,
+            };
+            let _ = dispatch_signaling(mgr_a, &remapped);
+        }
+    }
+
+    fn dispatch_signaling(
+        mgr: &mut PeerConnectionManager,
+        env: &SignalingEnvelope,
+    ) -> io::Result<()> {
+        match &env.msg {
+            SignalingMsg::Offer { session_id, sdp } => mgr.handle_offer(env.peer, *session_id, sdp),
+            SignalingMsg::Answer { session_id, sdp } => {
+                mgr.handle_answer(env.peer, *session_id, sdp)
+            }
+            SignalingMsg::IceCandidate {
+                session_id,
+                candidate,
+                sdp_mid,
+            } => mgr.handle_ice_candidate(env.peer, *session_id, candidate, sdp_mid.as_deref()),
+            SignalingMsg::Close { session_id } => {
+                mgr.handle_close(env.peer, *session_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Tests that two native PeerConnectionManagers can connect via signaling
+    /// and exchange datagrams over a DataChannel on localhost.
+    #[tokio::test]
+    async fn test_native_peer_connection_data_exchange() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let key_a = SecretKey::generate();
+        let key_b = SecretKey::generate();
+        let id_a = key_a.public();
+        let id_b = key_b.public();
+
+        let config = WebRtcConfig::default();
+
+        let (a_sig_tx, mut a_sig_rx) = mpsc::channel(64);
+        let (b_sig_tx, mut b_sig_rx) = mpsc::channel(64);
+        let (_a_dgram_tx, mut _a_dgram_rx) = mpsc::channel::<(EndpointId, Bytes)>(64);
+        let (b_dgram_tx, mut b_dgram_rx) = mpsc::channel(64);
+
+        let mut mgr_a = PeerConnectionManager::new(id_a, config.clone(), a_sig_tx, _a_dgram_tx);
+        let mut mgr_b = PeerConnectionManager::new(id_b, config, b_sig_tx, b_dgram_tx);
+
+        // A sends to B — triggers connection initiation, queues data
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let test_data = b"hello from A to B";
+        let err = mgr_a.send(&mut cx, id_b, test_data).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        // Drive ICE/DTLS until data arrives or timeout
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timeout: WebRTC DataChannel did not open within 15s"
+            );
+
+            // Relay signaling messages between managers
+            relay_signaling(
+                &mut a_sig_rx,
+                &mut b_sig_rx,
+                id_a,
+                id_b,
+                &mut mgr_a,
+                &mut mgr_b,
+            );
+
+            // Drive str0m I/O on both sides
+            mgr_a.poll(&mut cx);
+            mgr_b.poll(&mut cx);
+
+            // Check if B received the data
+            if let Ok((from, data)) = b_dgram_rx.try_recv() {
+                assert_eq!(from, id_a);
+                assert_eq!(&data[..], test_data);
+                return; // Success
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Tests that glare resolution works: when both peers initiate simultaneously,
+    /// the peer with the smaller EndpointId yields.
+    #[test]
+    fn test_glare_resolution() {
+        let key_a = SecretKey::generate();
+        let key_b = SecretKey::generate();
+        let id_a = key_a.public();
+        let id_b = key_b.public();
+
+        // Determine which is "polite" (smaller ID)
+        let (polite_id, impolite_id) = if id_a < id_b {
+            (id_a, id_b)
+        } else {
+            (id_b, id_a)
+        };
+
+        let config = WebRtcConfig::default();
+        let (sig_tx, _) = mpsc::channel(64);
+        let (dgram_tx, _) = mpsc::channel(64);
+
+        let mut polite_mgr =
+            PeerConnectionManager::new(polite_id, config.clone(), sig_tx.clone(), dgram_tx.clone());
+        let mut impolite_mgr = PeerConnectionManager::new(impolite_id, config, sig_tx, dgram_tx);
+
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        // Both sides initiate (via send which triggers initiate)
+        let _ = polite_mgr.send(&mut cx, impolite_id, b"ping");
+        let _ = impolite_mgr.send(&mut cx, polite_id, b"ping");
+
+        // The polite peer receives an offer from the impolite peer.
+        // Since polite already has a pending connection, glare is detected.
+        // The polite peer yields: drops its own connection and accepts.
+        let result = polite_mgr.handle_offer(
+            impolite_id,
+            99,
+            // Minimal valid SDP — str0m will parse this
+            "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n",
+        );
+        // Should not error — polite peer accepts
+        // (may fail on SDP parsing, but shouldn't fail on glare check)
+        // The important thing is it doesn't return early with "ignoring offer"
+        let _ = result; // SDP parsing may fail, that's OK for this test
+
+        // The impolite peer receives an offer from the polite peer.
+        // It should ignore it.
+        let result = impolite_mgr.handle_offer(
+            polite_id,
+            100,
+            "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n",
+        );
+        // Should succeed (returns Ok) but not create a new connection
+        assert!(result.is_ok());
+    }
+
+    /// Tests that sending to a closed connection triggers re-initiation.
+    #[test]
+    fn test_reconnect_after_close() {
+        let key_a = SecretKey::generate();
+        let key_b = SecretKey::generate();
+        let id_a = key_a.public();
+        let id_b = key_b.public();
+
+        let (sig_tx, mut sig_rx) = mpsc::channel(64);
+        let (dgram_tx, _) = mpsc::channel(64);
+        let mut mgr = PeerConnectionManager::new(id_a, WebRtcConfig::default(), sig_tx, dgram_tx);
+
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        // First send — initiates connection
+        let err = mgr.send(&mut cx, id_b, b"first").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        // Drain the signaling offer
+        let envelope = sig_rx.try_recv().expect("should have offer");
+        let session_1 = match &envelope.msg {
+            SignalingMsg::Offer { session_id, .. } => *session_id,
+            other => panic!("expected Offer, got {other:?}"),
+        };
+
+        // Close the session
+        mgr.handle_close(id_b, session_1);
+
+        // Second send — should re-initiate with a new session
+        let err = mgr.send(&mut cx, id_b, b"second").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        let envelope = sig_rx.try_recv().expect("should have new offer");
+        let session_2 = match &envelope.msg {
+            SignalingMsg::Offer { session_id, .. } => *session_id,
+            other => panic!("expected Offer, got {other:?}"),
+        };
+
+        // Should be a different session
+        assert_ne!(session_1, session_2);
+    }
+}

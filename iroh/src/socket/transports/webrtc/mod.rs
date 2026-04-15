@@ -348,3 +348,60 @@ pub(crate) struct SignalingChannel {
     /// Receive outgoing signaling from the WebRTC endpoint (webrtc → relay).
     pub outgoing_rx: mpsc::Receiver<SignalingEnvelope>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh_base::SecretKey;
+
+    #[test]
+    fn test_custom_addr_roundtrip() {
+        let key = SecretKey::generate();
+        let endpoint_id = key.public();
+
+        let addr = to_custom_addr(endpoint_id);
+        assert_eq!(addr.id(), WEBRTC_TRANSPORT_ID);
+
+        let parsed = parse_endpoint_id(&addr).unwrap();
+        assert_eq!(parsed, endpoint_id);
+    }
+
+    #[test]
+    fn test_parse_wrong_transport_id() {
+        let addr = CustomAddr::from((0x123456u64, &[0u8; 32][..]));
+        let err = parse_endpoint_id(&addr).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn test_parse_wrong_key_length() {
+        // 16 bytes instead of 32
+        let addr = CustomAddr::from((WEBRTC_TRANSPORT_ID, &[0u8; 16][..]));
+        let err = parse_endpoint_id(&addr).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn test_sender_validates_transport_id() {
+        let (sig_tx, _) = tokio::sync::mpsc::channel(1);
+        let (dgram_tx, _) = tokio::sync::mpsc::channel(1);
+        let key = SecretKey::generate();
+        let mgr = peer_connection::PeerConnectionManager::new(
+            key.public(),
+            WebRtcConfig::default(),
+            sig_tx,
+            dgram_tx,
+        );
+        let sender = WebRtcSender {
+            peer_mgr: Arc::new(std::sync::Mutex::new(mgr)),
+        };
+
+        // Valid WebRTC address
+        let valid = to_custom_addr(key.public());
+        assert!(sender.is_valid_send_addr(&valid));
+
+        // Wrong transport ID
+        let invalid = CustomAddr::from((0x999999u64, &[0u8; 32][..]));
+        assert!(!sender.is_valid_send_addr(&invalid));
+    }
+}
