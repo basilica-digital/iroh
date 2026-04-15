@@ -12,8 +12,8 @@
 use std::sync::OnceLock;
 
 use iroh::{
-    Endpoint, EndpointAddr, RelayMode,
-    endpoint::{presets, transports::webrtc::WebRtcConfig},
+    Endpoint, EndpointAddr, RelayMode, Watcher,
+    endpoint::{Connection, presets, transports::webrtc::WebRtcConfig},
 };
 use n0_future::task;
 use tracing::info;
@@ -96,6 +96,7 @@ pub async fn init() -> Result<String, JsValue> {
                     };
                     let remote = conn.remote_id().fmt_short().to_string();
                     log(&format!("Accepted connection from {remote}"));
+                    log_paths(&conn);
 
                     task::spawn(async move {
                         match handle_connection(conn).await {
@@ -119,8 +120,36 @@ pub async fn init() -> Result<String, JsValue> {
     Ok(addr_json)
 }
 
+/// Logs all network paths for a connection, highlighting the selected (active) one.
+fn log_paths(conn: &Connection) {
+    let mut paths = conn.paths();
+    let path_list = paths.get();
+    if path_list.is_empty() {
+        log("  paths: (none yet)");
+        return;
+    }
+    for path in path_list.iter() {
+        let addr = path.remote_addr();
+        let kind = if addr.is_relay() {
+            "relay"
+        } else if addr.is_ip() {
+            "ip"
+        } else if addr.is_custom() {
+            "webrtc (custom)"
+        } else {
+            "unknown"
+        };
+        let selected = if path.is_selected() { " [SELECTED]" } else { "" };
+        let rtt = path
+            .rtt()
+            .map(|d| format!(" rtt={d:?}"))
+            .unwrap_or_default();
+        log(&format!("  path: {kind}{selected}{rtt}"));
+    }
+}
+
 /// Handle an accepted connection: read messages and echo them back.
-async fn handle_connection(conn: iroh::endpoint::Connection) -> Result<(), String> {
+async fn handle_connection(conn: Connection) -> Result<(), String> {
     loop {
         let (mut send, mut recv) = conn.accept_bi().await.map_err(|e| format!("{e}"))?;
         let data = recv
@@ -162,6 +191,7 @@ pub async fn send_message(addr_json: &str, message: &str) -> Result<String, JsVa
         "Connected to {}! Sending message...",
         conn.remote_id().fmt_short()
     ));
+    log_paths(&conn);
 
     let (mut send, mut recv) = conn
         .open_bi()
