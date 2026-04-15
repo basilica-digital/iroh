@@ -61,7 +61,11 @@ struct PeerState {
     /// The browser RTCPeerConnection.
     pc: RtcPeerConnection,
     /// The DataChannel for sending/receiving QUIC datagrams.
+    /// Set directly for the offerer, or via [`remote_channel`] for the answerer.
     data_channel: Option<RtcDataChannel>,
+    /// Shared storage for the DataChannel received via `ondatachannel` (answerer side).
+    /// The JS callback writes here; [`poll()`] reads and moves it to [`data_channel`].
+    remote_channel: Rc<RefCell<Option<RtcDataChannel>>>,
     /// Unique session identifier for correlating signaling.
     session_id: u64,
     /// Current connection state.
@@ -70,6 +74,8 @@ struct PeerState {
     send_waker: Option<Waker>,
     /// Datagrams queued while the connection is being established.
     pending_sends: Vec<Bytes>,
+    /// Channel receiving events from JS callbacks (ICE state changes, DataChannel open/close).
+    event_rx: mpsc::Receiver<PeerEvent>,
     /// Closures we need to keep alive for the JS callbacks.
     _closures: Vec<Closure<dyn FnMut(JsValue)>>,
 }
@@ -80,7 +86,7 @@ impl std::fmt::Debug for PeerState {
             .field("session_id", &self.session_id)
             .field("state", &self.state)
             .field("pending_sends", &self.pending_sends.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -159,13 +165,19 @@ impl PeerConnectionManager {
     }
 
     /// Creates a new RTCPeerConnection with event handlers.
+    ///
+    /// Returns the peer connection, an event sender (for wiring up additional
+    /// callbacks like DataChannel events), the event receiver, and closures
+    /// that must be kept alive.
     fn create_peer_connection(
         &self,
         peer_id: EndpointId,
         session_id: u64,
     ) -> io::Result<(
         RtcPeerConnection,
+        mpsc::Sender<PeerEvent>,
         mpsc::Receiver<PeerEvent>,
+        Rc<RefCell<Option<RtcDataChannel>>>,
         Vec<Closure<dyn FnMut(JsValue)>>,
     )> {
         let config = self.create_rtc_config();
@@ -209,14 +221,22 @@ impl PeerConnectionManager {
         pc.set_oniceconnectionstatechange(Some(on_ice_state.as_ref().unchecked_ref()));
         closures.push(on_ice_state);
 
+        // Shared storage for the answerer's DataChannel (set by ondatachannel callback,
+        // read by poll() to move into PeerState.data_channel).
+        let remote_channel: Rc<RefCell<Option<RtcDataChannel>>> = Rc::new(RefCell::new(None));
+
         // ondatachannel (for the answerer — the offerer creates the channel directly)
         let datagram_tx = self.datagram_tx.clone();
         let event_tx_clone = event_tx.clone();
         let pid = peer_id;
+        let dc_ref = remote_channel.clone();
         let on_datachannel = Closure::wrap(Box::new(move |event: JsValue| {
             let event: RtcDataChannelEvent = event.unchecked_into();
             let channel = event.channel();
             channel.set_binary_type(RtcDataChannelType::Arraybuffer);
+
+            // Store channel reference so PeerState can pick it up in poll().
+            *dc_ref.borrow_mut() = Some(channel.clone());
 
             // Set up message handler on the received channel
             let dtx = datagram_tx.clone();
@@ -238,11 +258,18 @@ impl PeerConnectionManager {
             }) as Box<dyn FnMut(JsValue)>);
             channel.set_onopen(Some(on_open.as_ref().unchecked_ref()));
             on_open.forget();
+
+            let etx2 = event_tx_clone.clone();
+            let on_close = Closure::wrap(Box::new(move |_: JsValue| {
+                let _ = etx2.try_send(PeerEvent::DataChannelClose);
+            }) as Box<dyn FnMut(JsValue)>);
+            channel.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+            on_close.forget();
         }) as Box<dyn FnMut(JsValue)>);
         pc.set_ondatachannel(Some(on_datachannel.as_ref().unchecked_ref()));
         closures.push(on_datachannel);
 
-        Ok((pc, event_rx, closures))
+        Ok((pc, event_tx, event_rx, remote_channel, closures))
     }
 
     /// Sets up event handlers on a DataChannel we created (offerer side).
@@ -305,7 +332,8 @@ impl PeerConnectionManager {
         }
 
         let session_id = self.next_session_id();
-        let (pc, event_rx, mut closures) = self.create_peer_connection(peer_id, session_id)?;
+        let (pc, event_tx, event_rx, remote_channel, mut closures) =
+            self.create_peer_connection(peer_id, session_id)?;
 
         // Create DataChannel (as offerer)
         let mut dc_init = RtcDataChannelInit::new();
@@ -313,7 +341,7 @@ impl PeerConnectionManager {
         dc_init.set_max_retransmits(0);
 
         let channel = pc.create_data_channel_with_data_channel_dict(DATA_CHANNEL_LABEL, &dc_init);
-        let dc_closures = self.setup_data_channel_events(&channel, peer_id, &mpsc::channel(1).0);
+        let dc_closures = self.setup_data_channel_events(&channel, peer_id, &event_tx);
         closures.extend(dc_closures);
 
         // Spawn async task to create offer
@@ -357,10 +385,12 @@ impl PeerConnectionManager {
             PeerState {
                 pc,
                 data_channel: Some(channel),
+                remote_channel,
                 session_id,
                 state: ConnectionState::Connecting,
                 send_waker: None,
                 pending_sends: Vec::new(),
+                event_rx,
                 _closures: closures,
             },
         );
@@ -394,7 +424,8 @@ impl PeerConnectionManager {
             }
         }
 
-        let (pc, event_rx, closures) = self.create_peer_connection(peer_id, session_id)?;
+        let (pc, _event_tx, event_rx, remote_channel, closures) =
+            self.create_peer_connection(peer_id, session_id)?;
 
         // Set remote description (offer) and create answer
         let sdp_owned = sdp.to_string();
@@ -437,11 +468,13 @@ impl PeerConnectionManager {
             peer_id,
             PeerState {
                 pc,
-                data_channel: None, // Will be set via ondatachannel
+                data_channel: None, // Will be set via ondatachannel → remote_channel → poll()
+                remote_channel,
                 session_id,
                 state: ConnectionState::Connecting,
                 send_waker: None,
                 pending_sends: Vec::new(),
+                event_rx,
                 _closures: closures,
             },
         );
@@ -565,10 +598,85 @@ impl PeerConnectionManager {
         }
     }
 
-    /// Polls for events. On browser this is a no-op since events arrive via callbacks.
-    pub(crate) fn poll(&mut self, _cx: &mut Context) {
-        // Browser WebRTC is event-driven via JS callbacks.
-        // Events are delivered directly to the datagram_tx channel.
-        // No manual polling needed.
+    /// Polls for events from JS callbacks and updates peer connection states.
+    ///
+    /// JS callbacks push events into per-peer channels. This method drains
+    /// those channels and transitions `ConnectionState` accordingly.
+    pub(crate) fn poll(&mut self, cx: &mut Context) {
+        let peer_ids: Vec<EndpointId> = self.peers.keys().copied().collect();
+        for peer_id in peer_ids {
+            let Some(peer) = self.peers.get_mut(&peer_id) else {
+                continue;
+            };
+
+            // Drain all pending events for this peer.
+            loop {
+                match peer.event_rx.try_recv() {
+                    Ok(event) => match event {
+                        PeerEvent::DataChannelOpen => {
+                            debug!(
+                                peer = %peer_id.fmt_short(),
+                                session_id = peer.session_id,
+                                "DataChannel opened"
+                            );
+                            peer.state = ConnectionState::Connected;
+
+                            // On the answerer side, the DataChannel arrives via
+                            // the ondatachannel JS callback which stores it in
+                            // remote_channel. Move it into data_channel now.
+                            if peer.data_channel.is_none() {
+                                peer.data_channel = peer.remote_channel.borrow_mut().take();
+                            }
+
+                            // Flush pending sends.
+                            if let Some(channel) = &peer.data_channel {
+                                for data in peer.pending_sends.drain(..) {
+                                    if let Err(e) = channel.send_with_u8_array(&data) {
+                                        warn!(
+                                            peer = %peer_id.fmt_short(),
+                                            "failed to flush pending send: {e:?}"
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Wake the send task so QUIC retries on this path.
+                            if let Some(waker) = peer.send_waker.take() {
+                                waker.wake();
+                            }
+                        }
+                        PeerEvent::DataChannelClose => {
+                            debug!(
+                                peer = %peer_id.fmt_short(),
+                                "DataChannel closed"
+                            );
+                            peer.state = ConnectionState::Closed;
+                        }
+                        PeerEvent::DataChannelMessage(data) => {
+                            // Forward to the datagram channel.
+                            let _ = self.datagram_tx.try_send((peer_id, data));
+                        }
+                        PeerEvent::IceConnectionStateChange(state_str) => {
+                            trace!(
+                                peer = %peer_id.fmt_short(),
+                                state = %state_str,
+                                "ICE connection state changed"
+                            );
+                            if state_str.contains("failed") || state_str.contains("disconnected") {
+                                peer.state = ConnectionState::Closed;
+                            }
+                        }
+                        PeerEvent::IceCandidate { .. } | PeerEvent::IceGatheringComplete => {
+                            // ICE candidates are sent directly from the JS callback.
+                        }
+                    },
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        peer.state = ConnectionState::Closed;
+                        break;
+                    }
+                }
+            }
+        }
     }
 }

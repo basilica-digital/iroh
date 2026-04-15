@@ -752,6 +752,10 @@ impl Addr {
         matches!(self, Self::Ip(_))
     }
 
+    pub(crate) fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom(..))
+    }
+
     /// Returns `None` if not an `Ip`.
     pub(crate) fn into_socket_addr(self) -> Option<SocketAddr> {
         match self {

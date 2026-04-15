@@ -520,6 +520,19 @@ impl RemoteStateActor {
                         self.open_path(&remote);
                     }
                 }
+
+                // Open any known custom transport paths (e.g. WebRTC).
+                // Custom transports are not discovered through holepunching,
+                // so they must be opened explicitly.
+                let custom_paths = self
+                    .paths
+                    .addrs()
+                    .filter(|a| a.is_custom())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for remote in custom_paths {
+                    self.open_path(&remote);
+                }
             }
             self.trigger_holepunching();
         }
