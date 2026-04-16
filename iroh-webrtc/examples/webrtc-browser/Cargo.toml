@@ -8,7 +8,9 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-iroh = { path = "../..", features = ["unstable-webrtc-transport", "tls-ring"] }
+iroh = { path = "../../../iroh", default-features = false, features = ["unstable-custom-transports", "tls-ring"] }
+iroh-base = { path = "../../../iroh-base", default-features = false, features = ["key"] }
+iroh-webrtc = { path = "../..", default-features = false, features = ["iroh-signaling", "tls-ring"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"

@@ -23,8 +23,8 @@ use web_sys::{
     RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
 };
 
-use crate::socket::transports::webrtc::{
-    WebRtcConfig,
+use crate::{
+    config::WebRtcConfig,
     signaling::{SignalingEnvelope, SignalingMsg},
 };
 

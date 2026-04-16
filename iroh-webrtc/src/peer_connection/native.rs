@@ -27,8 +27,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
 use super::stun;
-use crate::socket::transports::webrtc::{
-    WebRtcConfig,
+use crate::{
+    config::WebRtcConfig,
     signaling::{SignalingEnvelope, SignalingMsg},
 };
 
@@ -1410,7 +1410,7 @@ mod tests {
 
         // TURN URLs should be ignored
         let config = WebRtcConfig {
-            ice_servers: vec![crate::socket::transports::webrtc::IceServer {
+            ice_servers: vec![crate::config::IceServer {
                 urls: vec!["turn:turn.example.com:3478".to_string()],
                 username: None,
                 credential: None,
@@ -1420,7 +1420,7 @@ mod tests {
 
         // Valid STUN URL should resolve (127.0.0.1 is always resolvable)
         let config = WebRtcConfig {
-            ice_servers: vec![crate::socket::transports::webrtc::IceServer {
+            ice_servers: vec![crate::config::IceServer {
                 urls: vec!["stun:127.0.0.1:19302".to_string()],
                 username: None,
                 credential: None,

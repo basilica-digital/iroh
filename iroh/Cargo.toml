@@ -76,15 +76,11 @@ futures-util = "0.3"
 axum = { version = "0.8", optional = true }
 sync_wrapper = { version = "1.0.2", features = ["futures"] }
 
-# webrtc transport
-postcard = { version = "1.1.1", features = ["use-std"], optional = true }
-
 # non-wasm-in-browser dependencies
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 hickory-resolver = { version = "=0.26.0-beta.1", default-features = false }
 portmapper = { version = "0.15", optional = true, default-features = false }
 noq = { version = "0.17.0", default-features = false, features = ["runtime-tokio", "rustls"] }
-str0m = { version = "0.18", optional = true }
 tokio = { version = "1", features = [
     "io-util",
     "macros",
@@ -98,26 +94,6 @@ tokio = { version = "1", features = [
 # wasm-in-browser dependencies
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 wasm-bindgen-futures = "0.4"
-wasm-bindgen = { version = "0.2", optional = true }
-js-sys = { version = "0.3", optional = true }
-web-sys = { version = "0.3", optional = true, features = [
-    "MessageEvent",
-    "RtcConfiguration",
-    "RtcDataChannel",
-    "RtcDataChannelEvent",
-    "RtcDataChannelInit",
-    "RtcDataChannelType",
-    "RtcIceCandidate",
-    "RtcIceCandidateInit",
-    "RtcIceConnectionState",
-    "RtcIceGatheringState",
-    "RtcPeerConnection",
-    "RtcPeerConnectionIceEvent",
-    "RtcSdpType",
-    "RtcSessionDescription",
-    "RtcSessionDescriptionInit",
-    "RtcIceServer",
-] }
 # we don't use time directly, but need to enable it because x509_parser uses these in browsers and we need to enable some feature flags for that to work
 time = { version = "0.3", features = ["wasm-bindgen"] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
@@ -190,8 +166,6 @@ tls-ring = ["noq/ring", "iroh-relay/tls-ring", "webpki/ring"]
 tls-aws-lc-rs = ["noq/aws-lc-rs", "iroh-relay/tls-aws-lc-rs", "webpki/aws-lc-rs"]
 # Unstable: Custom transport API (may change without notice)
 unstable-custom-transports = []
-# Unstable: WebRTC transport for direct P2P in browsers and native (may change without notice)
-unstable-webrtc-transport = ["unstable-custom-transports", "dep:postcard", "dep:str0m", "dep:web-sys", "dep:js-sys", "dep:wasm-bindgen"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -252,7 +226,3 @@ required-features = []
 [[example]]
 name = "incoming-filter"
 required-features = []
-
-[[example]]
-name = "webrtc-native"
-required-features = ["unstable-webrtc-transport"]

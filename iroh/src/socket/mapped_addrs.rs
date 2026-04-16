@@ -353,19 +353,6 @@ where
         let inner = self.inner.lock().expect("poisoned");
         inner.lookup.get(addr).cloned()
     }
-
-    /// Returns the first key satisfying `predicate`, if any.
-    ///
-    /// Useful for locating composite keys (e.g. `(RelayUrl, EndpointId)`) when
-    /// only part of the key is known.
-    #[cfg(feature = "unstable-webrtc-transport")]
-    pub(super) fn find_key<F>(&self, predicate: F) -> Option<K>
-    where
-        F: Fn(&K) -> bool,
-    {
-        let inner = self.inner.lock().expect("poisoned");
-        inner.addrs.keys().find(|k| predicate(k)).cloned()
-    }
 }
 
 #[derive(Debug)]

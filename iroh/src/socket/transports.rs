@@ -26,8 +26,6 @@ pub(crate) mod custom;
 #[cfg(not(wasm_browser))]
 mod ip;
 mod relay;
-#[cfg(feature = "unstable-webrtc-transport")]
-pub(crate) mod webrtc;
 
 use custom::{CustomEndpoint, CustomSender, CustomTransport};
 
@@ -48,15 +46,6 @@ pub(crate) struct Transports {
     poll_recv_counter: usize,
     /// Cache for source addrs, to speed up access
     source_addrs: [Addr; noq_udp::BATCH_SIZE],
-
-    /// Signaling channel for routing WebRTC signaling datagrams from relay to WebRTC transport.
-    #[cfg(feature = "unstable-webrtc-transport")]
-    webrtc_signaling: Option<webrtc::SignalingChannel>,
-    /// Cache mapping peers to their known relay URL, learned from incoming signaling.
-    /// Used by [`forward_outgoing_signaling`] to route signaling to the correct relay
-    /// for cross-relay WebRTC connections.
-    #[cfg(feature = "unstable-webrtc-transport")]
-    peer_relay_urls: FxHashMap<EndpointId, RelayUrl>,
 }
 
 /// Combined watcher type for all ip transports
@@ -107,11 +96,6 @@ pub(crate) enum TransportConfig {
     /// Custom transport factory.
     #[cfg_attr(not(feature = "unstable-custom-transports"), allow(dead_code))]
     Custom(Arc<dyn CustomTransport>),
-    /// WebRTC transport configuration (uses relay for signaling, DataChannels for data).
-    ///
-    /// The actual `WebRtcTransport` is created during bind, when the secret key is known.
-    #[cfg(feature = "unstable-webrtc-transport")]
-    WebRtc(webrtc::WebRtcConfig),
 }
 
 impl TransportConfig {
@@ -179,8 +163,6 @@ impl TransportConfig {
                 is_user_defined, ..
             } => *is_user_defined,
             Self::Custom(_) => true,
-            #[cfg(feature = "unstable-webrtc-transport")]
-            Self::WebRtc(_) => true,
         }
     }
 }
@@ -231,40 +213,15 @@ impl Transports {
             .collect();
 
         let mut custom = Vec::new();
-        #[cfg(feature = "unstable-webrtc-transport")]
-        let mut webrtc_signaling: Option<webrtc::SignalingChannel> = None;
-
-        for config in configs {
-            match config {
-                TransportConfig::Custom(factory) => {
-                    let transport = factory.bind()?;
-                    custom.push(transport);
-                }
-                #[cfg(feature = "unstable-webrtc-transport")]
-                TransportConfig::WebRtc(webrtc_cfg) => {
-                    if relay.is_empty() {
-                        warn!("WebRTC transport requires relay for signaling, skipping");
-                        continue;
-                    }
-
-                    // Create signaling channels for relay ↔ WebRTC communication
-                    let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(64);
-                    let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel(64);
-
-                    let transport = webrtc::WebRtcTransport::new(
-                        relay_actor_config.secret_key.clone(),
-                        webrtc_cfg.clone(),
-                    );
-                    let endpoint = transport.bind_with_signaling(incoming_rx, outgoing_tx)?;
-                    custom.push(endpoint);
-
-                    webrtc_signaling = Some(webrtc::SignalingChannel {
-                        incoming_tx,
-                        outgoing_rx,
-                    });
-                }
-                _ => {} // IP and Relay already handled above
+        for config in configs.iter().filter_map(|t| {
+            if let TransportConfig::Custom(config) = t {
+                Some(config)
+            } else {
+                None
             }
+        }) {
+            let transport = config.bind()?;
+            custom.push(transport);
         }
 
         Ok(Self {
@@ -274,10 +231,6 @@ impl Transports {
             custom,
             poll_recv_counter: Default::default(),
             source_addrs: Default::default(),
-            #[cfg(feature = "unstable-webrtc-transport")]
-            webrtc_signaling,
-            #[cfg(feature = "unstable-webrtc-transport")]
-            peer_relay_urls: FxHashMap::default(),
         })
     }
 
@@ -293,10 +246,6 @@ impl Transports {
         if sock.is_closing() {
             return Poll::Pending;
         }
-
-        // Forward outgoing WebRTC signaling through the relay.
-        #[cfg(feature = "unstable-webrtc-transport")]
-        self.forward_outgoing_signaling(cx, sock);
 
         match self.inner_poll_recv(cx, bufs, metas)? {
             Poll::Pending | Poll::Ready(0) => Poll::Pending,
@@ -327,30 +276,6 @@ impl Transports {
             };
         }
 
-        // Relay polling macro that intercepts WebRTC signaling datagrams.
-        // Signaling datagrams are forwarded to the WebRTC transport instead of QUIC.
-        macro_rules! poll_relay_transport {
-            ($socket:expr) => {
-                match $socket.poll_recv(cx, bufs, metas, &mut self.source_addrs)? {
-                    Poll::Pending | Poll::Ready(0) => {}
-                    Poll::Ready(n) => {
-                        #[cfg(feature = "unstable-webrtc-transport")]
-                        {
-                            let n = self.intercept_signaling(bufs, metas, n);
-                            if n > 0 {
-                                return Poll::Ready(Ok(n));
-                            }
-                            // All datagrams were signaling — don't return, keep polling
-                        }
-                        #[cfg(not(feature = "unstable-webrtc-transport"))]
-                        {
-                            return Poll::Ready(Ok(n));
-                        }
-                    }
-                }
-            };
-        }
-
         // To improve fairness, every other call reverses the ordering of polling.
 
         let counter = self.poll_recv_counter.wrapping_add(1);
@@ -359,10 +284,8 @@ impl Transports {
             #[cfg(not(wasm_browser))]
             poll_transport!(&mut self.ip);
 
-            // Use index-based iteration for relay transports to avoid holding a
-            // mutable borrow on `self.relay` across the signaling intercept call.
-            for i in 0..self.relay.len() {
-                poll_relay_transport!(&mut self.relay[i]);
+            for transport in self.relay.iter_mut() {
+                poll_transport!(transport);
             }
             for transport in self.custom.iter_mut() {
                 poll_transport!(transport);
@@ -371,8 +294,8 @@ impl Transports {
             for transport in self.custom.iter_mut().rev() {
                 poll_transport!(transport);
             }
-            for i in (0..self.relay.len()).rev() {
-                poll_relay_transport!(&mut self.relay[i]);
+            for transport in self.relay.iter_mut().rev() {
+                poll_transport!(transport);
             }
             #[cfg(not(wasm_browser))]
             poll_transport!(&mut self.ip);
@@ -503,146 +426,6 @@ impl Transports {
                 .iter()
                 .map(|t| t.create_network_change_sender())
                 .collect(),
-        }
-    }
-
-    /// Intercepts WebRTC signaling datagrams from relay-received data.
-    ///
-    /// Scans the first `n` filled buffer slots for datagrams matching the signaling
-    /// magic prefix. Matching datagrams are forwarded to the WebRTC transport's
-    /// signaling channel and removed from the buffer. Returns the number of
-    /// remaining (non-signaling) datagrams.
-    #[cfg(feature = "unstable-webrtc-transport")]
-    fn intercept_signaling(
-        &mut self,
-        bufs: &mut [IoSliceMut<'_>],
-        metas: &mut [noq_udp::RecvMeta],
-        n: usize,
-    ) -> usize {
-        let Some(signaling) = &self.webrtc_signaling else {
-            return n;
-        };
-
-        let mut write_idx = 0;
-        for read_idx in 0..n {
-            let data = &bufs[read_idx][..metas[read_idx].len];
-            if webrtc::signaling::is_signaling(data) {
-                // This is a signaling datagram — extract and forward to WebRTC
-                if let Some(msg) = webrtc::signaling::decode(data)
-                    && let Addr::Relay(relay_url, peer_id) = &self.source_addrs[read_idx]
-                {
-                    trace!(
-                        peer = %peer_id.fmt_short(),
-                        "intercepted WebRTC signaling from relay"
-                    );
-                    // Cache the relay URL so we can route outgoing signaling
-                    // to the peer's relay for cross-relay WebRTC connections.
-                    self.peer_relay_urls.insert(*peer_id, relay_url.clone());
-
-                    let envelope = webrtc::signaling::SignalingEnvelope {
-                        peer: *peer_id,
-                        msg,
-                    };
-                    if let Err(e) = signaling.incoming_tx.try_send(envelope) {
-                        warn!("failed to forward WebRTC signaling: {e}");
-                    }
-                }
-                // Skip this datagram (don't copy to write position)
-            } else {
-                // Non-signaling datagram — keep it
-                if write_idx != read_idx {
-                    // Swap buffer contents and metadata
-                    let len = metas[read_idx].len;
-                    // Copy data from read_idx to write_idx
-                    let (left, right) = bufs.split_at_mut(read_idx);
-                    left[write_idx][..len].copy_from_slice(&right[0][..len]);
-                    metas[write_idx] = metas[read_idx];
-                    self.source_addrs[write_idx] = self.source_addrs[read_idx].clone();
-                }
-                write_idx += 1;
-            }
-        }
-
-        write_idx
-    }
-
-    /// Forwards outgoing WebRTC signaling messages through the relay transport.
-    ///
-    /// Drains the outgoing signaling channel and sends each message as a tagged
-    /// relay datagram to the destination peer.
-    ///
-    /// Destination relay URL is resolved in this order:
-    ///   1. the URL cached from an incoming signaling datagram for this peer,
-    ///   2. the peer's home relay as registered in [`Socket::mapped_addrs`]
-    ///      (populated from the peer's `NodeAddr` when discovery / add_node_addr
-    ///      made the peer reachable),
-    ///   3. our own local relay as a last resort.
-    ///
-    /// (1) and (2) are what makes cross-relay WebRTC signaling work: the
-    /// initial offer from A to B has no cached URL yet, but A already knows B's
-    /// home relay from the `NodeAddr` supplied to `connect`. Falling back to
-    /// (3) is only correct when both peers share a relay; iroh relays do not
-    /// mesh, so signaling sent to A's relay targeting B is dropped when A and
-    /// B are on different relays.
-    #[cfg(feature = "unstable-webrtc-transport")]
-    fn forward_outgoing_signaling(&mut self, cx: &mut Context, sock: &Socket) {
-        let Some(signaling) = &mut self.webrtc_signaling else {
-            return;
-        };
-
-        while let Poll::Ready(Some(envelope)) = signaling.outgoing_rx.poll_recv(cx) {
-            debug!(
-                peer = %envelope.peer.fmt_short(),
-                msg_type = %match &envelope.msg {
-                    webrtc::signaling::SignalingMsg::Offer { .. } => "offer",
-                    webrtc::signaling::SignalingMsg::Answer { .. } => "answer",
-                    webrtc::signaling::SignalingMsg::IceCandidate { .. } => "ice-candidate",
-                    webrtc::signaling::SignalingMsg::Close { .. } => "close",
-                },
-                "forwarding WebRTC signaling via relay"
-            );
-            let payload = webrtc::signaling::encode(&envelope.msg);
-
-            // Resolve the peer's relay URL (see doc comment above).
-            let peer_relay = self
-                .peer_relay_urls
-                .get(&envelope.peer)
-                .cloned()
-                .or_else(|| {
-                    sock.mapped_addrs
-                        .relay_addrs
-                        .find_key(|(_, eid)| *eid == envelope.peer)
-                        .map(|(url, _)| url)
-                });
-
-            let mut sent = false;
-            for relay_transport in &self.relay {
-                let dest_url = if let Some(ref url) = peer_relay {
-                    url.clone()
-                } else if let Some((url, _)) = relay_transport.local_addr_watch().get() {
-                    url
-                } else {
-                    continue;
-                };
-
-                let send_item = relay::RelaySendItemExport {
-                    remote_endpoint: envelope.peer,
-                    url: dest_url,
-                    datagrams: iroh_relay::protos::relay::Datagrams::from(payload.clone()),
-                };
-                if let Err(e) = relay_transport.send_signaling(send_item) {
-                    warn!("failed to send WebRTC signaling via relay: {e}");
-                } else {
-                    sent = true;
-                }
-                break;
-            }
-            if !sent {
-                warn!(
-                    peer = %envelope.peer.fmt_short(),
-                    "no relay transport available for WebRTC signaling"
-                );
-            }
         }
     }
 }

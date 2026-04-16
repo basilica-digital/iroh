@@ -1,22 +1,27 @@
-//! WebRTC signaling protocol.
+//! WebRTC signaling protocol types.
 //!
-//! Signaling messages are exchanged between peers via the relay transport to
-//! establish WebRTC peer connections. Messages are tagged with a 4-byte magic
-//! prefix (`WRTC`) so they can be distinguished from regular QUIC datagrams
-//! in the relay stream.
+//! A signaling message ([`SignalingMsg`]) carries SDP offers/answers and
+//! trickled ICE candidates between two peers. An [`SignalingEnvelope`] pairs
+//! a message with the remote peer it comes from or is destined to.
+//!
+//! Signaling transport is pluggable: the [`WebRtc`](crate::WebRtc) handle
+//! exposes two mpsc endpoints (incoming + outgoing `SignalingEnvelope`) and
+//! the user is free to ferry messages over any channel — iroh QUIC streams,
+//! WebSocket, HTTP, anything bytes-in / bytes-out.
+//!
+//! The included [`iroh`] helper wires signaling to a dedicated ALPN on an
+//! iroh [`Endpoint`](iroh::Endpoint).
+
+#[cfg(feature = "iroh-signaling")]
+pub mod iroh;
 
 use bytes::Bytes;
 use iroh_base::EndpointId;
 use serde::{Deserialize, Serialize};
 
-/// Magic prefix for WebRTC signaling messages carried over relay datagrams.
-///
-/// ASCII for "WRTC" — used to demux signaling from regular QUIC traffic.
-pub(crate) const SIGNALING_MAGIC: [u8; 4] = [0x57, 0x52, 0x54, 0x43];
-
 /// A signaling message exchanged between peers to set up a WebRTC connection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum SignalingMsg {
+pub enum SignalingMsg {
     /// SDP offer from the initiating peer.
     Offer {
         /// Unique session identifier to correlate offer/answer pairs.
@@ -47,44 +52,27 @@ pub(crate) enum SignalingMsg {
     },
 }
 
-/// An envelope wrapping a signaling message with its source peer.
+/// An envelope wrapping a signaling message with its source/destination peer.
 #[derive(Debug, Clone)]
-pub(crate) struct SignalingEnvelope {
+pub struct SignalingEnvelope {
     /// The remote peer that sent (or should receive) this message.
     pub peer: EndpointId,
     /// The signaling message payload.
     pub msg: SignalingMsg,
 }
 
-/// Encodes a signaling message into a relay datagram payload.
+/// Encodes a signaling message as a postcard-serialized byte buffer.
 ///
-/// Format: `[SIGNALING_MAGIC (4 bytes)][postcard-encoded message]`
-pub(crate) fn encode(msg: &SignalingMsg) -> Bytes {
+/// Framing (e.g. length prefixing for stream transports) is up to the caller.
+pub fn encode(msg: &SignalingMsg) -> Bytes {
     let encoded =
         postcard::to_stdvec(msg).expect("signaling message serialization should not fail");
-    let mut buf = Vec::with_capacity(SIGNALING_MAGIC.len() + encoded.len());
-    buf.extend_from_slice(&SIGNALING_MAGIC);
-    buf.extend_from_slice(&encoded);
-    Bytes::from(buf)
+    Bytes::from(encoded)
 }
 
-/// Attempts to decode a signaling message from a relay datagram payload.
-///
-/// Returns `None` if the payload does not start with the signaling magic prefix
-/// or if deserialization fails (in which case it's a regular QUIC datagram).
-pub(crate) fn decode(data: &[u8]) -> Option<SignalingMsg> {
-    if data.len() < SIGNALING_MAGIC.len() {
-        return None;
-    }
-    if data[..SIGNALING_MAGIC.len()] != SIGNALING_MAGIC {
-        return None;
-    }
-    postcard::from_bytes(&data[SIGNALING_MAGIC.len()..]).ok()
-}
-
-/// Returns `true` if the datagram payload starts with the signaling magic prefix.
-pub(crate) fn is_signaling(data: &[u8]) -> bool {
-    data.len() >= SIGNALING_MAGIC.len() && data[..SIGNALING_MAGIC.len()] == SIGNALING_MAGIC
+/// Attempts to decode a postcard-serialized signaling message.
+pub fn decode(data: &[u8]) -> Option<SignalingMsg> {
+    postcard::from_bytes(data).ok()
 }
 
 #[cfg(test)]
@@ -98,7 +86,6 @@ mod tests {
             sdp: "v=0\r\no=- 123 456 IN IP4 0.0.0.0\r\n".to_string(),
         };
         let encoded = encode(&msg);
-        assert!(is_signaling(&encoded));
         let decoded = decode(&encoded).expect("should decode");
         assert_eq!(msg, decoded);
     }
@@ -135,25 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_signaling_data() {
-        // Regular QUIC packets should not be detected as signaling
-        let quic_data = [0x01, 0x02, 0x03, 0x04, 0x05];
-        assert!(!is_signaling(&quic_data));
-        assert!(decode(&quic_data).is_none());
-    }
-
-    #[test]
-    fn test_too_short() {
-        assert!(!is_signaling(&[0x57, 0x52]));
-        assert!(decode(&[0x57, 0x52]).is_none());
-    }
-
-    #[test]
-    fn test_magic_but_invalid_payload() {
-        // Magic prefix but garbage after it
-        let mut data = SIGNALING_MAGIC.to_vec();
-        data.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
-        assert!(is_signaling(&data));
-        assert!(decode(&data).is_none());
+    fn test_decode_garbage() {
+        assert!(decode(&[0xff, 0xff, 0xff, 0xff, 0xff]).is_none());
     }
 }

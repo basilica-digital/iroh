@@ -26,8 +26,10 @@ use std::io::Write as _;
 
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, Watcher,
-    endpoint::{Connection, presets, transports::webrtc::WebRtcConfig},
+    endpoint::{Connection, presets},
 };
+use iroh_base::SecretKey;
+use iroh_webrtc::{SIGNALING_ALPN, WebRtc, WebRtcConfig};
 use n0_error::{Result, StdResultExt};
 
 /// Must match the browser example's ALPN.
@@ -39,12 +41,19 @@ async fn main() -> Result<()> {
 
     println!("Creating iroh endpoint with WebRTC transport...");
 
+    let secret = SecretKey::generate();
+    let webrtc = WebRtc::new(secret.clone(), WebRtcConfig::default());
+
     let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret)
         .relay_mode(RelayMode::Staging)
-        .alpns(vec![ALPN.to_vec()])
-        .add_webrtc_transport(WebRtcConfig::default())
+        .alpns(vec![ALPN.to_vec(), SIGNALING_ALPN.to_vec()])
+        .add_custom_transport(webrtc.transport())
         .bind()
         .await?;
+
+    // Keep the signaling bridge alive for the lifetime of the process.
+    let _signaling = webrtc.attach_iroh_signaling(endpoint.clone());
 
     println!("Endpoint ID: {}", endpoint.id().fmt_short());
     println!("Waiting for relay connection...");
@@ -60,6 +69,7 @@ async fn main() -> Result<()> {
 
     // Spawn background acceptor
     let ep = endpoint.clone();
+    let signaling_handle = _signaling;
     let accept_handle = tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
             let conn = match incoming.await {
@@ -69,6 +79,10 @@ async fn main() -> Result<()> {
                     continue;
                 }
             };
+            if conn.alpn() == SIGNALING_ALPN {
+                signaling_handle.handle_incoming(conn);
+                continue;
+            }
             let remote = conn.remote_id().fmt_short().to_string();
             println!("Accepted connection from {remote}");
             print_paths(&conn);

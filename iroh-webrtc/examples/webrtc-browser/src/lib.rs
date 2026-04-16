@@ -3,18 +3,21 @@
 //! Build and serve with [Trunk](https://trunkrs.dev/):
 //!
 //! ```sh
-//! cd iroh/examples/webrtc-browser
+//! cd iroh-webrtc/examples/webrtc-browser
 //! trunk serve
 //! ```
 //!
 //! Then open two browser tabs at <http://localhost:8080>.
+#![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
 use std::sync::OnceLock;
 
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, Watcher,
-    endpoint::{Connection, presets, transports::webrtc::WebRtcConfig},
+    endpoint::{Connection, presets},
 };
+use iroh_base::SecretKey;
+use iroh_webrtc::{IrohSignaling, SIGNALING_ALPN, WebRtc, WebRtcConfig};
 use n0_future::task;
 use tracing::info;
 use wasm_bindgen::prelude::*;
@@ -26,6 +29,9 @@ static ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
 
 /// Global outgoing connection, set by `connect()`.
 static CONN: OnceLock<Connection> = OnceLock::new();
+
+/// Keep the iroh-webrtc signaling bridge alive for the lifetime of the page.
+static SIGNALING: OnceLock<IrohSignaling> = OnceLock::new();
 
 /// Append a line to the `#log` textarea in the page.
 fn log(msg: &str) {
@@ -61,13 +67,22 @@ pub async fn init() -> Result<String, JsValue> {
 
     log("Creating iroh endpoint with WebRTC transport...");
 
+    let secret = SecretKey::generate();
+    let webrtc = WebRtc::new(secret.clone(), WebRtcConfig::default());
+
     let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret)
         .relay_mode(RelayMode::Staging)
-        .alpns(vec![ALPN.to_vec()])
-        .add_webrtc_transport(WebRtcConfig::default())
+        .alpns(vec![ALPN.to_vec(), SIGNALING_ALPN.to_vec()])
+        .add_custom_transport(webrtc.transport())
         .bind()
         .await
         .map_err(|e| JsValue::from_str(&format!("bind failed: {e}")))?;
+
+    let signaling = webrtc.attach_iroh_signaling(endpoint.clone());
+    SIGNALING
+        .set(signaling)
+        .map_err(|_| JsValue::from_str("signaling already initialized"))?;
 
     log(&format!("Endpoint ID: {}", endpoint.id().fmt_short()));
     log("Waiting for relay connection...");
@@ -95,6 +110,14 @@ pub async fn init() -> Result<String, JsValue> {
                     continue;
                 }
             };
+            // Route signaling connections to iroh-webrtc; all others are
+            // application traffic.
+            if conn.alpn() == SIGNALING_ALPN {
+                if let Some(sig) = SIGNALING.get() {
+                    sig.handle_incoming(conn);
+                }
+                continue;
+            }
             let remote = conn.remote_id().fmt_short().to_string();
             log(&format!("Accepted connection from {remote}"));
             log_paths(&conn);
@@ -135,7 +158,11 @@ fn log_paths(conn: &Connection) {
         } else {
             "unknown"
         };
-        let selected = if path.is_selected() { " [SELECTED]" } else { "" };
+        let selected = if path.is_selected() {
+            " [SELECTED]"
+        } else {
+            ""
+        };
         let rtt = path
             .rtt()
             .map(|d| format!(" rtt={d:?}"))
@@ -184,10 +211,7 @@ pub async fn connect(addr_json: &str) -> Result<(), JsValue> {
         .await
         .map_err(|e| JsValue::from_str(&format!("connect failed: {e}")))?;
 
-    log(&format!(
-        "Connected to {}!",
-        conn.remote_id().fmt_short()
-    ));
+    log(&format!("Connected to {}!", conn.remote_id().fmt_short()));
     log_paths(&conn);
 
     CONN.set(conn)
@@ -250,11 +274,11 @@ pub fn get_addr() -> Result<String, JsValue> {
 /// transitions, addIceCandidate failures, and DataChannel open.
 #[wasm_bindgen]
 pub fn webrtc_debug() -> String {
-    iroh::endpoint::transports::webrtc::webrtc_debug_snapshot()
+    iroh_webrtc::webrtc_debug_snapshot()
 }
 
 /// Clears the WebRTC diagnostic log.
 #[wasm_bindgen]
 pub fn webrtc_debug_reset() {
-    iroh::endpoint::transports::webrtc::webrtc_debug_clear();
+    iroh_webrtc::webrtc_debug_clear();
 }

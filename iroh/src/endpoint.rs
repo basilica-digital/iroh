@@ -31,19 +31,6 @@ pub mod transports {
     #[cfg(feature = "unstable-custom-transports")]
     pub use super::socket::transports::custom::{CustomEndpoint, CustomSender, CustomTransport};
     pub use super::socket::transports::{Addr, AddrKind, Transmit, TransportBias};
-
-    /// WebRTC transport types for direct P2P via DataChannels.
-    #[cfg(feature = "unstable-webrtc-transport")]
-    pub mod webrtc {
-        pub use crate::socket::transports::webrtc::{IceServer, WebRtcConfig, WebRtcTransport};
-
-        /// Diagnostic snapshot of WebRTC signaling/ICE events (browser only).
-        ///
-        /// Returns the current debug log as a newline-joined string, suitable for
-        /// being rendered in a textarea and copy-pasted for debugging.
-        #[cfg(wasm_browser)]
-        pub use crate::socket::transports::webrtc::{webrtc_debug_clear, webrtc_debug_snapshot};
-    }
 }
 
 use self::hooks::EndpointHooksList;
@@ -772,20 +759,6 @@ impl Builder {
     #[cfg(feature = "unstable-custom-transports")]
     pub fn add_custom_transport(mut self, factory: Arc<dyn CustomTransport>) -> Self {
         self.transports.push(TransportConfig::Custom(factory));
-        self
-    }
-
-    /// Adds a WebRTC transport for direct peer-to-peer via WebRTC DataChannels.
-    ///
-    /// The WebRTC transport uses the relay for signaling (SDP/ICE exchange)
-    /// and then establishes direct DataChannel connections between peers.
-    /// This is especially useful for browser/Wasm endpoints.
-    #[cfg(feature = "unstable-webrtc-transport")]
-    pub fn add_webrtc_transport(
-        mut self,
-        config: crate::socket::transports::webrtc::WebRtcConfig,
-    ) -> Self {
-        self.transports.push(TransportConfig::WebRtc(config));
         self
     }
 

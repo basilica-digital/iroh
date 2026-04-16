@@ -1,34 +1,26 @@
 //! WebRTC custom transport for direct peer-to-peer connections.
 //!
-//! This module implements the [`CustomTransport`] trait using WebRTC DataChannels,
-//! enabling direct P2P connections between iroh endpoints — particularly useful in
-//! browser/Wasm environments where raw UDP sockets are not available.
+//! Implements iroh's [`CustomTransport`] trait using WebRTC DataChannels,
+//! enabling direct P2P connections between iroh endpoints — particularly
+//! useful in browser/Wasm environments where raw UDP sockets are not
+//! available.
 //!
 //! # Architecture
 //!
-//! The transport carries QUIC datagrams over unreliable, unordered WebRTC DataChannels.
-//! QUIC handles reliability and ordering, so the DataChannel acts as a raw datagram pipe.
+//! The transport carries QUIC datagrams over unreliable, unordered WebRTC
+//! DataChannels. QUIC handles reliability and ordering, so the DataChannel
+//! acts as a raw datagram pipe.
 //!
-//! Signaling (SDP offer/answer and ICE candidate exchange) is performed through the
-//! relay transport: signaling messages are tagged with a magic prefix and demuxed from
-//! regular QUIC traffic at the [`Transports`](super::Transports) layer.
+//! Signaling (SDP offer/answer and ICE candidate exchange) is pluggable: the
+//! transport exposes its signaling flow via two [`mpsc`] endpoints, and the
+//! user is free to pipe them over any carrier. See [`crate::signaling::iroh`]
+//! for a ready-made iroh-ALPN bridge.
 //!
-//! # Platform Support
+//! # Platform support
 //!
-//! - **Browser (Wasm)**: Uses the browser's native `RTCPeerConnection` via `web-sys`.
-//! - **Native**: Uses the [`str0m`] crate, a pure-Rust sans-I/O WebRTC implementation.
-
-mod peer_connection;
-pub(crate) mod signaling;
-
-/// Returns the current in-browser WebRTC diagnostic log (browser only).
-///
-/// Exposed so example apps and users debugging mobile browsers can surface the
-/// log via a copy button on the page. Entries are prefixed with a
-/// `Date.now()` millisecond timestamp and cover SDP offer/answer exchange,
-/// local/remote ICE candidates, state changes, and errors.
-#[cfg(wasm_browser)]
-pub use peer_connection::{webrtc_debug_clear, webrtc_debug_snapshot};
+//! - **Browser (Wasm)**: uses the browser's native `RTCPeerConnection` via
+//!   `web-sys`.
+//! - **Native**: uses [`str0m`], a pure-Rust sans-I/O WebRTC implementation.
 
 use std::{
     io,
@@ -37,89 +29,84 @@ use std::{
 };
 
 use bytes::Bytes;
+use iroh::endpoint::transports::{Addr, CustomEndpoint, CustomSender, CustomTransport, Transmit};
 use iroh_base::{CustomAddr, EndpointId, SecretKey};
 use n0_watcher::Watchable;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
-use self::{
+use crate::{
+    addr::{parse_endpoint_id, to_custom_addr},
+    config::WebRtcConfig,
     peer_connection::PeerConnectionManager,
     signaling::{SignalingEnvelope, SignalingMsg},
 };
-use super::{Addr, CustomEndpoint, CustomSender, Transmit};
 
-/// Transport ID for WebRTC, registered in `TRANSPORTS.md`.
+/// Bundled signaling channel ends stashed inside the transport until
+/// [`CustomTransport::bind`] is called.
 ///
-/// ASCII for "WRT" = `0x575254`.
-pub const WEBRTC_TRANSPORT_ID: u64 = 0x575254;
-
-/// Configuration for a STUN or TURN server used during ICE gathering.
-#[derive(Debug, Clone)]
-pub struct IceServer {
-    /// STUN/TURN server URLs (e.g. `"stun:stun.l.google.com:19302"`).
-    pub urls: Vec<String>,
-    /// Optional username for TURN authentication.
-    pub username: Option<String>,
-    /// Optional credential for TURN authentication.
-    pub credential: Option<String>,
-}
-
-impl Default for IceServer {
-    fn default() -> Self {
-        Self {
-            urls: vec![
-                "stun:stun.l.google.com:19302".to_string(),
-                "stun:stun1.l.google.com:19302".to_string(),
-            ],
-            username: None,
-            credential: None,
-        }
-    }
-}
-
-/// Configuration for the WebRTC transport.
-#[derive(Debug, Clone)]
-pub struct WebRtcConfig {
-    /// ICE servers to use for gathering candidates.
-    pub ice_servers: Vec<IceServer>,
-}
-
-impl Default for WebRtcConfig {
-    fn default() -> Self {
-        Self {
-            ice_servers: vec![IceServer::default()],
-        }
-    }
-}
+/// `CustomTransport::bind` takes `&self`, so it cannot move fields out of the
+/// transport. We put the to-be-consumed ends behind an `Option<Mutex<…>>` and
+/// `.take()` them at bind time. Binding twice is an error.
+type ChannelSlot = Arc<
+    Mutex<
+        Option<(
+            mpsc::Receiver<SignalingEnvelope>,
+            mpsc::Sender<SignalingEnvelope>,
+        )>,
+    >,
+>;
 
 /// WebRTC transport factory.
 ///
-/// Creates [`WebRtcEndpoint`] instances when bound. Each endpoint manages
-/// peer connections and signaling for a single iroh endpoint.
+/// Instantiate via [`crate::WebRtc::new`] or construct directly with
+/// [`WebRtcTransport::new`] if you want to drive signaling yourself.
 #[derive(Debug, Clone)]
 pub struct WebRtcTransport {
     secret_key: SecretKey,
     config: WebRtcConfig,
+    channels: ChannelSlot,
 }
 
 impl WebRtcTransport {
-    /// Creates a new WebRTC transport with the given secret key and configuration.
-    pub fn new(secret_key: SecretKey, config: WebRtcConfig) -> Self {
-        Self { secret_key, config }
-    }
-
-    /// Binds the transport with externally-provided signaling channels.
+    /// Creates a new WebRTC transport factory paired with externally-provided
+    /// signaling channels.
     ///
-    /// The signaling channels are wired by the [`Transports`](super::Transports) layer
-    /// to route signaling datagrams between the relay transport and this WebRTC endpoint.
+    /// - `signaling_incoming_rx` receives [`SignalingEnvelope`]s that should
+    ///   be fed into the transport's state machine (messages coming *from*
+    ///   the remote peer).
+    /// - `signaling_outgoing_tx` collects [`SignalingEnvelope`]s that the
+    ///   transport wants to send *to* the remote peer.
     ///
-    /// - `signaling_incoming_rx`: receives signaling messages intercepted from relay datagrams
-    /// - `signaling_outgoing_tx`: sends signaling messages to be forwarded through the relay
-    pub(crate) fn bind_with_signaling(
-        &self,
+    /// The caller is responsible for moving bytes between these channels and
+    /// whatever signaling carrier they use (e.g. iroh QUIC streams via
+    /// [`crate::signaling::iroh::IrohSignaling`], a WebSocket, etc.).
+    pub fn new(
+        secret_key: SecretKey,
+        config: WebRtcConfig,
         signaling_incoming_rx: mpsc::Receiver<SignalingEnvelope>,
         signaling_outgoing_tx: mpsc::Sender<SignalingEnvelope>,
-    ) -> io::Result<Box<dyn CustomEndpoint>> {
+    ) -> Self {
+        Self {
+            secret_key,
+            config,
+            channels: Arc::new(Mutex::new(Some((
+                signaling_incoming_rx,
+                signaling_outgoing_tx,
+            )))),
+        }
+    }
+}
+
+impl CustomTransport for WebRtcTransport {
+    fn bind(&self) -> io::Result<Box<dyn CustomEndpoint>> {
+        let (signaling_incoming_rx, signaling_outgoing_tx) = self
+            .channels
+            .lock()
+            .expect("poisoned")
+            .take()
+            .ok_or_else(|| io::Error::other("WebRtcTransport already bound"))?;
+
         let my_id = self.secret_key.public();
         let (datagram_tx, datagram_rx) = mpsc::channel(512);
 
@@ -142,43 +129,24 @@ impl WebRtcTransport {
     }
 }
 
-/// Converts an [`EndpointId`] to a [`CustomAddr`] for this transport.
-pub fn to_custom_addr(endpoint: EndpointId) -> CustomAddr {
-    CustomAddr::from((WEBRTC_TRANSPORT_ID, &endpoint.as_bytes()[..]))
-}
-
-/// Parses an [`EndpointId`] from a WebRTC [`CustomAddr`].
-fn parse_endpoint_id(addr: &CustomAddr) -> io::Result<EndpointId> {
-    if addr.id() != WEBRTC_TRANSPORT_ID {
-        return Err(io::Error::other("not a WebRTC transport address"));
-    }
-    let key_bytes: &[u8; 32] = addr
-        .data()
-        .try_into()
-        .map_err(|_| io::Error::other("invalid WebRTC address: wrong key length"))?;
-    EndpointId::from_bytes(key_bytes)
-        .map_err(|_| io::Error::other("invalid WebRTC address: bad public key"))
-}
-
 /// A bound WebRTC endpoint implementing [`CustomEndpoint`].
 ///
-/// Manages peer connections and routes datagrams between the QUIC stack
-/// and WebRTC DataChannels.
+/// Manages peer connections and shuttles datagrams between the QUIC stack and
+/// WebRTC DataChannels.
 #[derive(Debug)]
 pub(crate) struct WebRtcEndpoint {
     addrs: Watchable<Vec<CustomAddr>>,
     peer_mgr: Arc<Mutex<PeerConnectionManager>>,
 
-    /// Incoming signaling messages from the relay (fed by the `Transports` layer).
+    /// Incoming signaling messages fed in by the user-side signaling bridge.
     signaling_incoming_rx: mpsc::Receiver<SignalingEnvelope>,
     /// Datagrams received from peer DataChannels.
     datagram_rx: mpsc::Receiver<(EndpointId, Bytes)>,
 }
 
 impl WebRtcEndpoint {
-    /// Processes pending incoming signaling messages.
-    ///
-    /// Called from `poll_recv` to drive the signaling state machine.
+    /// Drives the signaling state machine by draining any pending inbound
+    /// signaling messages.
     fn process_signaling(&mut self, cx: &mut Context) {
         while let Poll::Ready(Some(envelope)) = self.signaling_incoming_rx.poll_recv(cx) {
             let mut mgr = self.peer_mgr.lock().expect("poisoned");
@@ -318,7 +286,7 @@ struct WebRtcSender {
 
 impl CustomSender for WebRtcSender {
     fn is_valid_send_addr(&self, addr: &CustomAddr) -> bool {
-        addr.id() == WEBRTC_TRANSPORT_ID
+        addr.id() == crate::addr::WEBRTC_TRANSPORT_ID
     }
 
     fn poll_send(
@@ -338,11 +306,11 @@ impl CustomSender for WebRtcSender {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // Data has been queued in pending_sends and will be flushed
                     // when the DataChannel opens. Report success so QUIC's path
-                    // validation tracks the PATH_CHALLENGE payload. If we returned
-                    // Pending, QUIC would not track it, and when the response
-                    // eventually arrives it would be silently dropped as
-                    // unrecognized — causing path validation to always fail when
-                    // the DataChannel takes time to establish.
+                    // validation tracks the PATH_CHALLENGE payload. If we
+                    // returned Pending, QUIC would not track it, and when the
+                    // response eventually arrives it would be silently dropped
+                    // as unrecognized — causing path validation to always fail
+                    // when the DataChannel takes time to establish.
                     debug!(
                         peer = %peer_id.fmt_short(),
                         "WebRTC send queued (DataChannel connecting)"
@@ -356,59 +324,17 @@ impl CustomSender for WebRtcSender {
     }
 }
 
-/// Channels used by the `Transports` layer to shuttle signaling messages
-/// between the relay transport and the WebRTC transport.
-#[derive(Debug)]
-pub(crate) struct SignalingChannel {
-    /// Send signaling to the WebRTC endpoint (relay → webrtc).
-    pub incoming_tx: mpsc::Sender<SignalingEnvelope>,
-    /// Receive outgoing signaling from the WebRTC endpoint (webrtc → relay).
-    pub outgoing_rx: mpsc::Receiver<SignalingEnvelope>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iroh_base::SecretKey;
-
-    #[test]
-    fn test_custom_addr_roundtrip() {
-        let key = SecretKey::generate();
-        let endpoint_id = key.public();
-
-        let addr = to_custom_addr(endpoint_id);
-        assert_eq!(addr.id(), WEBRTC_TRANSPORT_ID);
-
-        let parsed = parse_endpoint_id(&addr).unwrap();
-        assert_eq!(parsed, endpoint_id);
-    }
-
-    #[test]
-    fn test_parse_wrong_transport_id() {
-        let addr = CustomAddr::from((0x123456u64, &[0u8; 32][..]));
-        let err = parse_endpoint_id(&addr).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-    }
-
-    #[test]
-    fn test_parse_wrong_key_length() {
-        // 16 bytes instead of 32
-        let addr = CustomAddr::from((WEBRTC_TRANSPORT_ID, &[0u8; 16][..]));
-        let err = parse_endpoint_id(&addr).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-    }
 
     #[tokio::test]
     async fn test_sender_validates_transport_id() {
         let (sig_tx, _) = tokio::sync::mpsc::channel(1);
         let (dgram_tx, _) = tokio::sync::mpsc::channel(1);
         let key = SecretKey::generate();
-        let mgr = peer_connection::PeerConnectionManager::new(
-            key.public(),
-            WebRtcConfig::default(),
-            sig_tx,
-            dgram_tx,
-        );
+        let mgr =
+            PeerConnectionManager::new(key.public(), WebRtcConfig::default(), sig_tx, dgram_tx);
         let sender = WebRtcSender {
             peer_mgr: Arc::new(std::sync::Mutex::new(mgr)),
         };
@@ -420,5 +346,17 @@ mod tests {
         // Wrong transport ID
         let invalid = CustomAddr::from((0x999999u64, &[0u8; 32][..]));
         assert!(!sender.is_valid_send_addr(&invalid));
+    }
+
+    #[tokio::test]
+    async fn test_bind_twice_fails() {
+        let (_in_tx, in_rx) = tokio::sync::mpsc::channel(1);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+        let key = SecretKey::generate();
+        let t = WebRtcTransport::new(key, WebRtcConfig::default(), in_rx, out_tx);
+        let first = t.bind();
+        assert!(first.is_ok());
+        let second = t.bind();
+        assert!(second.is_err());
     }
 }
