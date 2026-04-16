@@ -1255,13 +1255,11 @@ impl Endpoint {
         let watch_relay = self.inner.home_relay();
         let watch_custom = self.inner.custom_addrs();
         let endpoint_id = self.id();
-        watch_relay
-            .or(watch_custom)
-            .map(move |(relays, custom)| {
-                let relay_addrs = relays.into_iter().map(TransportAddr::Relay);
-                let custom_addrs = custom.into_iter().map(TransportAddr::Custom);
-                EndpointAddr::from_parts(endpoint_id, relay_addrs.chain(custom_addrs))
-            })
+        watch_relay.or(watch_custom).map(move |(relays, custom)| {
+            let relay_addrs = relays.into_iter().map(TransportAddr::Relay);
+            let custom_addrs = custom.into_iter().map(TransportAddr::Custom);
+            EndpointAddr::from_parts(endpoint_id, relay_addrs.chain(custom_addrs))
+        })
     }
 
     /// A convenience method that waits for the endpoint to be considered "online".

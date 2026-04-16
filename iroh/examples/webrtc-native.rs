@@ -103,10 +103,7 @@ async fn main() -> Result<()> {
         println!("Connecting to {}...", peer_addr.id.fmt_short());
 
         let conn = endpoint.connect(peer_addr, ALPN).await?;
-        println!(
-            "Connected to {}!",
-            conn.remote_id().fmt_short()
-        );
+        println!("Connected to {}!", conn.remote_id().fmt_short());
         print_paths(&conn);
 
         // Interactive send loop
@@ -163,7 +160,11 @@ fn print_paths(conn: &Connection) {
         } else {
             "unknown"
         };
-        let selected = if path.is_selected() { " [SELECTED]" } else { "" };
+        let selected = if path.is_selected() {
+            " [SELECTED]"
+        } else {
+            ""
+        };
         let rtt = path
             .rtt()
             .map(|d| format!(" rtt={d:?}"))
