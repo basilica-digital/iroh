@@ -7,10 +7,11 @@
 use std::{
     collections::HashMap,
     fmt, io,
-    net::UdpSocket,
-    task::{Context, Waker},
+    task::{Context, Poll, Waker},
     time::Instant,
 };
+
+use tokio::io::ReadBuf;
 
 use bytes::Bytes;
 use iroh_base::EndpointId;
@@ -51,7 +52,9 @@ struct PeerState {
     /// The str0m RTC instance driving this connection.
     rtc: Rtc,
     /// The UDP socket bound for this peer's ICE traffic.
-    socket: UdpSocket,
+    /// Uses tokio so `poll_recv_from` registers the async waker,
+    /// ensuring immediate wake-up when data arrives.
+    socket: tokio::net::UdpSocket,
     /// Unique session identifier for correlating signaling.
     session_id: u64,
     /// The DataChannel ID once opened.
@@ -129,12 +132,12 @@ impl PeerConnectionManager {
     /// - The socket can send/receive to remote peers (not just loopback)
     ///
     /// Falls back to `127.0.0.1` if no default route is available.
-    fn bind_socket() -> io::Result<UdpSocket> {
+    fn bind_socket() -> io::Result<tokio::net::UdpSocket> {
         let bind_ip = Self::default_local_ip()
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        let socket = UdpSocket::bind(std::net::SocketAddr::new(bind_ip, 0))?;
-        socket.set_nonblocking(true)?;
-        Ok(socket)
+        let std_socket = std::net::UdpSocket::bind(std::net::SocketAddr::new(bind_ip, 0))?;
+        std_socket.set_nonblocking(true)?;
+        tokio::net::UdpSocket::from_std(std_socket)
     }
 
     /// Discovers the default outgoing IP address using the UDP "connect trick".
@@ -142,7 +145,7 @@ impl PeerConnectionManager {
     /// Connecting a UDP socket to an external address (without sending data)
     /// lets the OS pick the outgoing interface, which we read back.
     fn default_local_ip() -> Option<std::net::IpAddr> {
-        let probe = UdpSocket::bind("0.0.0.0:0").ok()?;
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
         probe.connect("8.8.8.8:80").ok()?;
         probe.local_addr().ok().map(|a| a.ip())
     }
@@ -429,16 +432,22 @@ impl PeerConnectionManager {
     /// - Read incoming UDP packets and feed them to str0m
     /// - Process str0m outputs (outgoing packets, events)
     /// - Handle DataChannel events
-    pub(crate) fn poll(&mut self, _cx: &mut Context) {
+    pub(crate) fn poll(&mut self, cx: &mut Context) {
         let now = Instant::now();
         let mut events = Vec::new();
 
         for (peer_id, peer) in &mut self.peers {
-            // Read incoming UDP packets
+            // Read incoming UDP packets.
+            // Using tokio's poll_recv_from registers the waker so the task
+            // wakes immediately when data arrives (instead of waiting for
+            // the next QUIC timer).
             let mut buf = [0u8; 2000];
             loop {
-                match peer.socket.recv_from(&mut buf) {
-                    Ok((n, source)) => {
+                let mut read_buf = ReadBuf::new(&mut buf);
+                match peer.socket.poll_recv_from(cx, &mut read_buf) {
+                    Poll::Ready(Ok(source)) => {
+                        let n = read_buf.filled().len();
+                        drop(read_buf);
                         let local_addr = peer
                             .socket
                             .local_addr()
@@ -465,14 +474,14 @@ impl PeerConnectionManager {
                             );
                         }
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
+                    Poll::Ready(Err(e)) => {
                         warn!(
                             peer = %peer_id.fmt_short(),
                             "UDP recv error: {e}"
                         );
                         break;
                     }
+                    Poll::Pending => break,
                 }
             }
 
@@ -496,7 +505,7 @@ impl PeerConnectionManager {
                         );
                         if let Err(e) = peer
                             .socket
-                            .send_to(&transmit.contents, transmit.destination)
+                            .try_send_to(&transmit.contents, transmit.destination)
                         {
                             warn!(
                                 peer = %peer_id.fmt_short(),
@@ -617,25 +626,23 @@ impl PeerConnectionManager {
     ///
     /// After writing data to a DataChannel via `channel.write()`, str0m buffers
     /// the SCTP/DTLS frames internally. They are only emitted as UDP packets
-    /// through `poll_output()`. Normally `poll()` drives this, but `poll()` only
-    /// runs inside `poll_recv()` which may not be called promptly (the str0m UDP
-    /// socket is not registered with the async runtime). Calling this immediately
-    /// after a write ensures the data is transmitted without waiting for the next
-    /// poll cycle.
+    /// through `poll_output()`. This method drains all ready outputs and, if
+    /// none are immediately available, fast-forwards to str0m's next scheduled
+    /// timeout to force buffered data out.
     fn flush_peer_outputs(peer: &mut PeerState, peer_id: &EndpointId) {
-        let now = Instant::now();
-        // Drive str0m's state machine so it processes the buffered write.
-        if let Err(e) = peer.rtc.handle_input(Input::Timeout(now)) {
-            trace!(
-                peer = %peer_id.fmt_short(),
-                "str0m timeout during flush: {e}"
-            );
-        }
+        let mut produced_transmit = false;
         loop {
             match peer.rtc.poll_output() {
                 Ok(Output::Transmit(transmit)) => {
+                    produced_transmit = true;
+                    trace!(
+                        peer = %peer_id.fmt_short(),
+                        dst = %transmit.destination,
+                        len = transmit.contents.len(),
+                        "flush transmit"
+                    );
                     if let Err(e) =
-                        peer.socket.send_to(&transmit.contents, transmit.destination)
+                        peer.socket.try_send_to(&transmit.contents, transmit.destination)
                     {
                         warn!(
                             peer = %peer_id.fmt_short(),
@@ -645,12 +652,52 @@ impl PeerConnectionManager {
                     }
                 }
                 Ok(Output::Event(_)) => {
-                    // Events (e.g. channel state changes) will be handled
-                    // in the next poll() call.
+                    // Events will be handled in the next poll() call.
                 }
-                Ok(Output::Timeout(_)) => break,
-                Err(_) => break,
+                Ok(Output::Timeout(t)) => {
+                    // Fast-forward to the next str0m timeout to flush any
+                    // data that was buffered but not yet packaged.
+                    let _ = peer.rtc.handle_input(Input::Timeout(t));
+                    loop {
+                        match peer.rtc.poll_output() {
+                            Ok(Output::Transmit(transmit)) => {
+                                produced_transmit = true;
+                                trace!(
+                                    peer = %peer_id.fmt_short(),
+                                    dst = %transmit.destination,
+                                    len = transmit.contents.len(),
+                                    "flush transmit (post-timeout)"
+                                );
+                                if let Err(e) = peer
+                                    .socket
+                                    .try_send_to(&transmit.contents, transmit.destination)
+                                {
+                                    warn!(
+                                        peer = %peer_id.fmt_short(),
+                                        dst = %transmit.destination,
+                                        "UDP send error during flush: {e}"
+                                    );
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        peer = %peer_id.fmt_short(),
+                        "str0m error during flush: {e}"
+                    );
+                    break;
+                }
             }
+        }
+        if !produced_transmit {
+            debug!(
+                peer = %peer_id.fmt_short(),
+                "flush produced no transmits"
+            );
         }
     }
 }
@@ -781,8 +828,8 @@ mod tests {
 
     /// Tests that glare resolution works: when both peers initiate simultaneously,
     /// the peer with the smaller EndpointId yields.
-    #[test]
-    fn test_glare_resolution() {
+    #[tokio::test]
+    async fn test_glare_resolution() {
         let key_a = SecretKey::generate();
         let key_b = SecretKey::generate();
         let id_a = key_a.public();
@@ -836,8 +883,8 @@ mod tests {
     }
 
     /// Tests that sending to a closed connection triggers re-initiation.
-    #[test]
-    fn test_reconnect_after_close() {
+    #[tokio::test]
+    async fn test_reconnect_after_close() {
         let key_a = SecretKey::generate();
         let key_b = SecretKey::generate();
         let id_a = key_a.public();
@@ -904,8 +951,8 @@ mod tests {
 
     /// Verifies that str0m includes the host candidate in the SDP offer,
     /// which is needed for browsers to learn the native peer's ICE candidate.
-    #[test]
-    fn test_sdp_contains_host_candidate() {
+    #[tokio::test]
+    async fn test_sdp_contains_host_candidate() {
         let key = SecretKey::generate();
         let id = key.public();
 
