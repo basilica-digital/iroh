@@ -328,14 +328,23 @@ impl CustomSender for WebRtcSender {
         );
         let mut mgr = self.peer_mgr.lock().expect("poisoned");
 
-        // Split into individual datagrams if GSO segments are present
+        // Split into individual datagrams if GSO segments are present.
         let segment_size = transmit.segment_size.unwrap_or(transmit.contents.len());
         for chunk in transmit.contents.chunks(segment_size) {
             match mgr.send(cx, peer_id, chunk) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // Connection not ready yet, return Pending
-                    return Poll::Pending;
+                    // Data has been queued in pending_sends and will be flushed
+                    // when the DataChannel opens. Report success so QUIC's path
+                    // validation tracks the PATH_CHALLENGE payload. If we returned
+                    // Pending, QUIC would not track it, and when the response
+                    // eventually arrives it would be silently dropped as
+                    // unrecognized — causing path validation to always fail when
+                    // the DataChannel takes time to establish.
+                    debug!(
+                        peer = %peer_id.fmt_short(),
+                        "WebRTC send queued (DataChannel connecting)"
+                    );
                 }
                 Err(e) => return Poll::Ready(Err(e)),
             }
