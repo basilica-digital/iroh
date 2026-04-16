@@ -1127,7 +1127,7 @@ mod tests {
 
         // A sends to B — triggers connection initiation, queues data
         let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cx = std::task::Context::from_waker(waker);
 
         let test_data = b"hello from A to B";
         let err = mgr_a.send(&mut cx, id_b, test_data).unwrap_err();
@@ -1196,7 +1196,7 @@ mod tests {
             PeerConnectionManager::new(impolite_id, WebRtcConfig::default(), sig_tx, dgram_tx);
 
         let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cx = std::task::Context::from_waker(waker);
 
         // Both sides initiate (via send which triggers initiate)
         let _ = polite_mgr.send(&mut cx, impolite_id, b"ping");
@@ -1245,7 +1245,7 @@ mod tests {
         let mut mgr = PeerConnectionManager::new(id_a, cfg, sig_tx, dgram_tx);
 
         let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cx = std::task::Context::from_waker(waker);
 
         // First send — initiates connection
         let err = mgr.send(&mut cx, id_b, b"first").unwrap_err();
@@ -1331,7 +1331,7 @@ mod tests {
         let mut mgr = PeerConnectionManager::new(id, cfg, sig_tx, dgram_tx);
 
         let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cx = std::task::Context::from_waker(waker);
 
         let peer_key = SecretKey::generate();
         let peer_id = peer_key.public();
@@ -1375,7 +1375,7 @@ mod tests {
         let mut mgr = PeerConnectionManager::new(id_a, WebRtcConfig::default(), sig_tx, dgram_tx);
 
         let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cx = std::task::Context::from_waker(waker);
 
         // Initiate a connection to create the peer state
         let _ = mgr.send(&mut cx, id_b, b"test");

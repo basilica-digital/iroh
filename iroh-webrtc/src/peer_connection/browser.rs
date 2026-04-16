@@ -15,18 +15,36 @@ use bytes::Bytes;
 use iroh_base::EndpointId;
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use tokio::sync::mpsc;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{
     MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelEvent, RtcDataChannelInit,
-    RtcDataChannelType, RtcIceCandidateInit, RtcIceConnectionState, RtcPeerConnection,
-    RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescriptionInit,
+    RtcDataChannelType, RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent,
+    RtcSdpType, RtcSessionDescriptionInit,
 };
 
 use crate::{
     config::WebRtcConfig,
     signaling::{SignalingEnvelope, SignalingMsg},
 };
+
+/// ICE candidate buffered until `setRemoteDescription` completes. Tuple of
+/// `(candidate, sdp_mid)`.
+type BufferedCandidate = (String, Option<String>);
+
+/// Shared queue of ICE candidates waiting for the remote description.
+type PendingCandidates = Rc<RefCell<Vec<BufferedCandidate>>>;
+
+/// Pieces returned from `create_peer_connection`: the peer connection, the
+/// event sender/receiver, a slot where the remote-opened DataChannel will be
+/// stashed, and closures that must outlive the callbacks.
+type PeerConnectionInit = (
+    RtcPeerConnection,
+    mpsc::Sender<PeerEvent>,
+    mpsc::Receiver<PeerEvent>,
+    Rc<RefCell<Option<RtcDataChannel>>>,
+    Vec<Closure<dyn FnMut(JsValue)>>,
+);
 
 /// Label for the unreliable datagram DataChannel.
 const DATA_CHANNEL_LABEL: &str = "iroh-quic";
@@ -156,7 +174,7 @@ struct PeerState {
     /// `addIceCandidate()` fails if called before the remote description is set,
     /// so we queue candidates here and flush them once the description is applied.
     /// Shared with the async block that applies the remote description.
-    pending_remote_candidates: Rc<RefCell<Vec<(String, Option<String>)>>>,
+    pending_remote_candidates: PendingCandidates,
     /// Closures we need to keep alive for the JS callbacks.
     _closures: Vec<Closure<dyn FnMut(JsValue)>>,
 }
@@ -183,21 +201,16 @@ enum ConnectionState {
 }
 
 /// Events from JavaScript callbacks, pushed into a channel.
+///
+/// ICE candidates and DataChannel messages are *not* routed through here —
+/// they are forwarded directly from their JS closures into `signaling_tx` and
+/// `datagram_tx` respectively, since they don't need the manager's state.
 #[derive(Debug)]
 enum PeerEvent {
-    /// ICE candidate gathered locally.
-    IceCandidate {
-        candidate: String,
-        sdp_mid: Option<String>,
-    },
-    /// ICE gathering produced a null candidate (gathering complete).
-    IceGatheringComplete,
     /// ICE connection state changed.
     IceConnectionStateChange(String),
     /// DataChannel opened (either created by us or received from remote).
     DataChannelOpen,
-    /// Data received on the DataChannel.
-    DataChannelMessage(Bytes),
     /// DataChannel closed.
     DataChannelClose,
 }
@@ -254,13 +267,7 @@ impl PeerConnectionManager {
         &self,
         peer_id: EndpointId,
         session_id: u64,
-    ) -> io::Result<(
-        RtcPeerConnection,
-        mpsc::Sender<PeerEvent>,
-        mpsc::Receiver<PeerEvent>,
-        Rc<RefCell<Option<RtcDataChannel>>>,
-        Vec<Closure<dyn FnMut(JsValue)>>,
-    )> {
+    ) -> io::Result<PeerConnectionInit> {
         let config = self.create_rtc_config();
         let pc = RtcPeerConnection::new_with_configuration(&config)
             .map_err(|e| io::Error::other(format!("failed to create RTCPeerConnection: {e:?}")))?;
@@ -438,7 +445,7 @@ impl PeerConnectionManager {
             self.create_peer_connection(peer_id, session_id)?;
 
         // Create DataChannel (as offerer)
-        let mut dc_init = RtcDataChannelInit::new();
+        let dc_init = RtcDataChannelInit::new();
         dc_init.set_ordered(false);
         dc_init.set_max_retransmits(0);
 
@@ -483,7 +490,7 @@ impl PeerConnectionManager {
                 summary = summarize_sdp_candidates(&offer_sdp)
             ));
 
-            let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+            let desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
             desc.set_sdp(&offer_sdp);
             if let Err(e) =
                 wasm_bindgen_futures::JsFuture::from(pc_clone.set_local_description(&desc)).await
@@ -542,21 +549,21 @@ impl PeerConnectionManager {
         sdp: &str,
     ) -> io::Result<()> {
         // Glare resolution: peer with smaller EndpointId yields
-        if let Some(existing) = self.peers.get(&peer_id) {
-            if existing.state == ConnectionState::Connecting {
-                if self.my_id < peer_id {
-                    debug!(
-                        peer = %peer_id.fmt_short(),
-                        "glare detected, yielding as polite peer"
-                    );
-                    self.peers.remove(&peer_id);
-                } else {
-                    debug!(
-                        peer = %peer_id.fmt_short(),
-                        "glare detected, ignoring offer as impolite peer"
-                    );
-                    return Ok(());
-                }
+        if let Some(existing) = self.peers.get(&peer_id)
+            && existing.state == ConnectionState::Connecting
+        {
+            if self.my_id < peer_id {
+                debug!(
+                    peer = %peer_id.fmt_short(),
+                    "glare detected, yielding as polite peer"
+                );
+                self.peers.remove(&peer_id);
+            } else {
+                debug!(
+                    peer = %peer_id.fmt_short(),
+                    "glare detected, ignoring offer as impolite peer"
+                );
+                return Ok(());
             }
         }
 
@@ -577,13 +584,12 @@ impl PeerConnectionManager {
         let signaling_tx = self.signaling_tx.clone();
         let pc_clone = pc.clone();
         let remote_desc_set = Rc::new(Cell::new(false));
-        let pending_remote_candidates: Rc<RefCell<Vec<(String, Option<String>)>>> =
-            Rc::new(RefCell::new(Vec::new()));
+        let pending_remote_candidates: PendingCandidates = Rc::new(RefCell::new(Vec::new()));
         let rds = remote_desc_set.clone();
         let prc = pending_remote_candidates.clone();
         let peer_short = peer_id.fmt_short().to_string();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut offer_desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+            let offer_desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
             offer_desc.set_sdp(&sdp_owned);
             if let Err(e) =
                 wasm_bindgen_futures::JsFuture::from(pc_clone.set_remote_description(&offer_desc))
@@ -611,7 +617,7 @@ impl PeerConnectionManager {
                 ));
             }
             for (candidate, sdp_mid) in buffered {
-                let mut init = RtcIceCandidateInit::new(&candidate);
+                let init = RtcIceCandidateInit::new(&candidate);
                 if let Some(mid) = &sdp_mid {
                     init.set_sdp_mid(Some(mid));
                 }
@@ -663,7 +669,7 @@ impl PeerConnectionManager {
                 summary = summarize_sdp_candidates(&answer_sdp)
             ));
 
-            let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
+            let desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
             desc.set_sdp(&answer_sdp);
             if let Err(e) =
                 wasm_bindgen_futures::JsFuture::from(pc_clone.set_local_description(&desc)).await
@@ -737,7 +743,7 @@ impl PeerConnectionManager {
         let prc = peer.pending_remote_candidates.clone();
         let peer_short = peer_id.fmt_short().to_string();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
+            let desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
             desc.set_sdp(&sdp_owned);
             if let Err(e) =
                 wasm_bindgen_futures::JsFuture::from(pc_clone.set_remote_description(&desc)).await
@@ -764,7 +770,7 @@ impl PeerConnectionManager {
                 ));
             }
             for (candidate, sdp_mid) in buffered {
-                let mut init = RtcIceCandidateInit::new(&candidate);
+                let init = RtcIceCandidateInit::new(&candidate);
                 if let Some(mid) = &sdp_mid {
                     init.set_sdp_mid(Some(mid));
                 }
@@ -838,7 +844,7 @@ impl PeerConnectionManager {
         ));
 
         let candidate_owned = candidate.to_string();
-        let mut init = RtcIceCandidateInit::new(candidate);
+        let init = RtcIceCandidateInit::new(candidate);
         if let Some(mid) = sdp_mid {
             init.set_sdp_mid(Some(mid));
         }
@@ -874,19 +880,19 @@ impl PeerConnectionManager {
 
     /// Handles a close request for a session.
     pub(crate) fn handle_close(&mut self, peer_id: EndpointId, session_id: u64) {
-        if let Some(peer) = self.peers.get(&peer_id) {
-            if peer.session_id == session_id {
-                debug!(
-                    peer = %peer_id.fmt_short(),
-                    session_id,
-                    "closing WebRTC connection"
-                );
-                debug_record(format!(
-                    "[{peer}] received CLOSE signal (session={session_id})",
-                    peer = peer_id.fmt_short()
-                ));
-                self.peers.remove(&peer_id);
-            }
+        if let Some(peer) = self.peers.get(&peer_id)
+            && peer.session_id == session_id
+        {
+            debug!(
+                peer = %peer_id.fmt_short(),
+                session_id,
+                "closing WebRTC connection"
+            );
+            debug_record(format!(
+                "[{peer}] received CLOSE signal (session={session_id})",
+                peer = peer_id.fmt_short()
+            ));
+            self.peers.remove(&peer_id);
         }
     }
 
@@ -991,10 +997,6 @@ impl PeerConnectionManager {
                             );
                             peer.state = ConnectionState::Closed;
                         }
-                        PeerEvent::DataChannelMessage(data) => {
-                            // Forward to the datagram channel.
-                            let _ = self.datagram_tx.try_send((peer_id, data));
-                        }
                         PeerEvent::IceConnectionStateChange(state_str) => {
                             debug!(
                                 peer = %peer_id.fmt_short(),
@@ -1004,9 +1006,6 @@ impl PeerConnectionManager {
                             if state_str.contains("failed") || state_str.contains("disconnected") {
                                 peer.state = ConnectionState::Closed;
                             }
-                        }
-                        PeerEvent::IceCandidate { .. } | PeerEvent::IceGatheringComplete => {
-                            // ICE candidates are sent directly from the JS callback.
                         }
                     },
                     Poll::Ready(None) => {
