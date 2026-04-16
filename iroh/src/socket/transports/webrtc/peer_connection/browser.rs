@@ -204,14 +204,16 @@ impl PeerConnectionManager {
             if let Some(candidate) = event.candidate() {
                 let candidate_str = candidate.candidate();
                 if !candidate_str.is_empty() {
-                    let _ = signaling_tx.try_send(SignalingEnvelope {
+                    if let Err(e) = signaling_tx.try_send(SignalingEnvelope {
                         peer: pid,
                         msg: SignalingMsg::IceCandidate {
                             session_id: sid,
                             candidate: candidate_str,
                             sdp_mid: candidate.sdp_mid(),
                         },
-                    });
+                    }) {
+                        warn!("failed to send local ICE candidate via signaling: {e}");
+                    }
                 }
             }
         }) as Box<dyn FnMut(JsValue)>);
@@ -474,17 +476,27 @@ impl PeerConnectionManager {
 
             // Remote description is now set — flush any buffered ICE candidates.
             rds.set(true);
-            for (candidate, sdp_mid) in prc.borrow_mut().drain(..) {
+            let buffered: Vec<_> = prc.borrow_mut().drain(..).collect();
+            if !buffered.is_empty() {
+                debug!(
+                    count = buffered.len(),
+                    "flushing buffered ICE candidates after setRemoteDescription (answerer)"
+                );
+            }
+            for (candidate, sdp_mid) in buffered {
                 let mut init = RtcIceCandidateInit::new(&candidate);
                 if let Some(mid) = &sdp_mid {
                     init.set_sdp_mid(Some(mid));
                 }
-                if let Err(e) = wasm_bindgen_futures::JsFuture::from(
+                match wasm_bindgen_futures::JsFuture::from(
                     pc_clone.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&init)),
                 )
                 .await
                 {
-                    warn!(%candidate, ?e, "addIceCandidate failed for buffered candidate");
+                    Ok(_) => debug!(%candidate, "addIceCandidate succeeded (buffered, answerer)"),
+                    Err(e) => {
+                        warn!(%candidate, ?e, "addIceCandidate failed for buffered candidate")
+                    }
                 }
             }
 
@@ -580,17 +592,27 @@ impl PeerConnectionManager {
 
             // Remote description is now set — flush any buffered ICE candidates.
             rds.set(true);
-            for (candidate, sdp_mid) in prc.borrow_mut().drain(..) {
+            let buffered: Vec<_> = prc.borrow_mut().drain(..).collect();
+            if !buffered.is_empty() {
+                debug!(
+                    count = buffered.len(),
+                    "flushing buffered ICE candidates after setRemoteDescription (offerer)"
+                );
+            }
+            for (candidate, sdp_mid) in buffered {
                 let mut init = RtcIceCandidateInit::new(&candidate);
                 if let Some(mid) = &sdp_mid {
                     init.set_sdp_mid(Some(mid));
                 }
-                if let Err(e) = wasm_bindgen_futures::JsFuture::from(
+                match wasm_bindgen_futures::JsFuture::from(
                     pc_clone.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&init)),
                 )
                 .await
                 {
-                    warn!(%candidate, ?e, "addIceCandidate failed for buffered candidate");
+                    Ok(_) => debug!(%candidate, "addIceCandidate succeeded (buffered, offerer)"),
+                    Err(e) => {
+                        warn!(%candidate, ?e, "addIceCandidate failed for buffered candidate")
+                    }
                 }
             }
         });
@@ -774,7 +796,7 @@ impl PeerConnectionManager {
                             let _ = self.datagram_tx.try_send((peer_id, data));
                         }
                         PeerEvent::IceConnectionStateChange(state_str) => {
-                            trace!(
+                            debug!(
                                 peer = %peer_id.fmt_short(),
                                 state = %state_str,
                                 "ICE connection state changed"

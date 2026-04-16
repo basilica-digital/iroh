@@ -566,7 +566,7 @@ impl Transports {
         };
 
         while let Poll::Ready(Some(envelope)) = signaling.outgoing_rx.poll_recv(cx) {
-            trace!(
+            debug!(
                 peer = %envelope.peer.fmt_short(),
                 msg_type = %match &envelope.msg {
                     webrtc::signaling::SignalingMsg::Offer { .. } => "offer",
