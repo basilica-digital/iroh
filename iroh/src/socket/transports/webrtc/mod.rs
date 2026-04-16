@@ -90,9 +90,6 @@ impl Default for WebRtcConfig {
 #[derive(Debug, Clone)]
 pub struct WebRtcTransport {
     secret_key: SecretKey,
-    // Used on browser for ICE server configuration; native str0m doesn't
-    // support configurable ICE servers yet.
-    #[cfg_attr(not(wasm_browser), allow(dead_code))]
     config: WebRtcConfig,
 }
 
@@ -119,7 +116,6 @@ impl WebRtcTransport {
 
         let peer_mgr = PeerConnectionManager::new(
             my_id,
-            #[cfg(wasm_browser)]
             self.config.clone(),
             signaling_outgoing_tx,
             datagram_tx,
@@ -398,7 +394,12 @@ mod tests {
         let (sig_tx, _) = tokio::sync::mpsc::channel(1);
         let (dgram_tx, _) = tokio::sync::mpsc::channel(1);
         let key = SecretKey::generate();
-        let mgr = peer_connection::PeerConnectionManager::new(key.public(), sig_tx, dgram_tx);
+        let mgr = peer_connection::PeerConnectionManager::new(
+            key.public(),
+            WebRtcConfig::default(),
+            sig_tx,
+            dgram_tx,
+        );
         let sender = WebRtcSender {
             peer_mgr: Arc::new(std::sync::Mutex::new(mgr)),
         };

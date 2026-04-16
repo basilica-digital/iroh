@@ -7,6 +7,7 @@
 use std::{
     collections::HashMap,
     fmt, io,
+    net::SocketAddr,
     task::{Context, Poll, Waker},
     time::Instant,
 };
@@ -24,7 +25,11 @@ use str0m::{
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
-use crate::socket::transports::webrtc::signaling::{SignalingEnvelope, SignalingMsg};
+use super::stun;
+use crate::socket::transports::webrtc::{
+    WebRtcConfig,
+    signaling::{SignalingEnvelope, SignalingMsg},
+};
 
 /// Label for the unreliable datagram DataChannel.
 const DATA_CHANNEL_LABEL: &str = "iroh-quic";
@@ -41,6 +46,17 @@ pub(crate) struct PeerConnectionManager {
     datagram_tx: mpsc::Sender<(EndpointId, Bytes)>,
     /// Counter for generating unique session IDs.
     next_session_id: u64,
+    /// Resolved STUN server addresses for server-reflexive candidate gathering.
+    stun_servers: Vec<SocketAddr>,
+}
+
+/// A pending STUN binding request awaiting a response from a STUN server.
+#[derive(Debug)]
+struct StunProbe {
+    /// Address of the STUN server we sent the request to.
+    server_addr: SocketAddr,
+    /// Transaction ID to match the response.
+    transaction_id: [u8; 12],
 }
 
 /// State of a single peer connection.
@@ -63,6 +79,8 @@ struct PeerState {
     pending_sends: Vec<Bytes>,
     /// Pending SDP offer awaiting an answer (offerer side only).
     pending_offer: Option<SdpPendingOffer>,
+    /// Pending STUN probes for server-reflexive candidate gathering.
+    stun_probes: Vec<StunProbe>,
 }
 
 impl fmt::Debug for PeerState {
@@ -76,6 +94,7 @@ impl fmt::Debug for PeerState {
             .field("send_waker", &self.send_waker)
             .field("pending_sends", &self.pending_sends)
             .field("pending_offer", &self.pending_offer.as_ref().map(|_| ".."))
+            .field("stun_probes", &self.stun_probes)
             .finish()
     }
 }
@@ -93,17 +112,31 @@ enum ConnectionState {
 
 impl PeerConnectionManager {
     /// Creates a new peer connection manager.
+    ///
+    /// Resolves STUN server addresses from the config at construction time.
     pub(crate) fn new(
         my_id: EndpointId,
+        config: WebRtcConfig,
         signaling_tx: mpsc::Sender<SignalingEnvelope>,
         datagram_tx: mpsc::Sender<(EndpointId, Bytes)>,
     ) -> Self {
+        let stun_servers = resolve_stun_servers(&config);
+        if stun_servers.is_empty() {
+            debug!("no STUN servers configured — server-reflexive candidates will not be gathered");
+        } else {
+            debug!(
+                count = stun_servers.len(),
+                "resolved STUN servers for srflx gathering"
+            );
+        }
+
         Self {
             my_id,
             peers: HashMap::new(),
             signaling_tx,
             datagram_tx,
             next_session_id: 0,
+            stun_servers,
         }
     }
 
@@ -147,6 +180,37 @@ impl PeerConnectionManager {
         id
     }
 
+    /// Sends STUN Binding Requests to all configured STUN servers for a peer's socket.
+    ///
+    /// Returns the list of pending probes. STUN responses will be handled in [`poll()`].
+    fn send_stun_probes(&self, socket: &tokio::net::UdpSocket) -> Vec<StunProbe> {
+        let mut probes = Vec::with_capacity(self.stun_servers.len());
+        for &server_addr in &self.stun_servers {
+            let mut transaction_id = [0u8; 12];
+            rand::fill(&mut transaction_id);
+            let request = stun::build_binding_request(&transaction_id);
+            match socket.try_send_to(&request, server_addr) {
+                Ok(_) => {
+                    trace!(
+                        %server_addr,
+                        "sent STUN binding request"
+                    );
+                    probes.push(StunProbe {
+                        server_addr,
+                        transaction_id,
+                    });
+                }
+                Err(e) => {
+                    debug!(
+                        %server_addr,
+                        "failed to send STUN binding request: {e}"
+                    );
+                }
+            }
+        }
+        probes
+    }
+
     /// Initiates a connection to a remote peer (we are the offerer).
     fn initiate(&mut self, peer_id: EndpointId) -> io::Result<()> {
         if self.peers.contains_key(&peer_id) {
@@ -184,6 +248,11 @@ impl PeerConnectionManager {
             "initiating WebRTC connection (native offerer)"
         );
 
+        // Start STUN probes for server-reflexive candidate discovery.
+        // The srflx candidate will be trickled via signaling when the
+        // STUN response arrives in poll().
+        let stun_probes = self.send_stun_probes(&socket);
+
         let _ = self.signaling_tx.try_send(SignalingEnvelope {
             peer: peer_id,
             msg: SignalingMsg::Offer { session_id, sdp },
@@ -200,6 +269,7 @@ impl PeerConnectionManager {
                 send_waker: None,
                 pending_sends: Vec::new(),
                 pending_offer: Some(pending),
+                stun_probes,
             },
         );
 
@@ -261,6 +331,9 @@ impl PeerConnectionManager {
             "accepted WebRTC offer, sending answer (native answerer)"
         );
 
+        // Start STUN probes for server-reflexive candidate discovery.
+        let stun_probes = self.send_stun_probes(&socket);
+
         let _ = self.signaling_tx.try_send(SignalingEnvelope {
             peer: peer_id,
             msg: SignalingMsg::Answer {
@@ -280,6 +353,7 @@ impl PeerConnectionManager {
                 send_waker: None,
                 pending_sends: Vec::new(),
                 pending_offer: None,
+                stun_probes,
             },
         );
 
@@ -339,6 +413,18 @@ impl PeerConnectionManager {
 
         if peer.session_id != session_id {
             return Err(io::Error::other("session_id mismatch"));
+        }
+
+        // Skip mDNS candidates (*.local addresses) — they can't be resolved by
+        // str0m and are only useful on the same LAN. Browsers generate these as
+        // privacy-preserving host candidates.
+        if candidate.contains(".local") {
+            debug!(
+                peer = %peer_id.fmt_short(),
+                session_id,
+                "skipping mDNS ICE candidate (not resolvable by native)"
+            );
+            return Ok(());
         }
 
         let candidate = Candidate::from_sdp_string(candidate)
@@ -425,6 +511,9 @@ impl PeerConnectionManager {
     pub(crate) fn poll(&mut self, cx: &mut Context) {
         let now = Instant::now();
         let mut events = Vec::new();
+        // Collect srflx candidates discovered via STUN to trickle after the loop
+        // (can't send signaling while holding a mutable borrow on self.peers).
+        let mut trickle_candidates: Vec<(EndpointId, u64, String)> = Vec::new();
 
         for (peer_id, peer) in &mut self.peers {
             // Read incoming UDP packets.
@@ -437,10 +526,45 @@ impl PeerConnectionManager {
                 match peer.socket.poll_recv_from(cx, &mut read_buf) {
                     Poll::Ready(Ok(source)) => {
                         let n = read_buf.filled().len();
+
+                        // Check if this is a STUN Binding Response from one of our
+                        // probes (for server-reflexive candidate gathering).
+                        if let Some(probe_idx) = peer
+                            .stun_probes
+                            .iter()
+                            .position(|p| p.server_addr == source)
+                        {
+                            let probe = &peer.stun_probes[probe_idx];
+                            if let Some(mapped_addr) =
+                                stun::parse_binding_response(&buf[..n], &probe.transaction_id)
+                            {
+                                let local_addr = peer
+                                    .socket
+                                    .local_addr()
+                                    .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+
+                                if let Ok(candidate) =
+                                    Candidate::server_reflexive(mapped_addr, local_addr, "udp")
+                                {
+                                    info!(
+                                        peer = %peer_id.fmt_short(),
+                                        %mapped_addr,
+                                        %local_addr,
+                                        "discovered server-reflexive candidate via STUN"
+                                    );
+                                    let sdp = candidate.to_sdp_string();
+                                    peer.rtc.add_local_candidate(candidate);
+                                    trickle_candidates.push((*peer_id, peer.session_id, sdp));
+                                }
+                            }
+                            peer.stun_probes.swap_remove(probe_idx);
+                            continue;
+                        }
+
                         let local_addr = peer
                             .socket
                             .local_addr()
-                            .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
                         let receive = match Receive::new(
                             str0m::net::Protocol::Udp,
                             source,
@@ -521,6 +645,18 @@ impl PeerConnectionManager {
         // Process events outside the borrow of self.peers
         for (peer_id, event) in events {
             self.handle_event(peer_id, event);
+        }
+
+        // Trickle server-reflexive candidates discovered via STUN
+        for (peer_id, session_id, candidate_sdp) in trickle_candidates {
+            let _ = self.signaling_tx.try_send(SignalingEnvelope {
+                peer: peer_id,
+                msg: SignalingMsg::IceCandidate {
+                    session_id,
+                    candidate: candidate_sdp,
+                    sdp_mid: Some("0".to_string()),
+                },
+            });
         }
     }
 
@@ -686,6 +822,40 @@ impl PeerConnectionManager {
     }
 }
 
+/// Resolves STUN server addresses from the WebRTC configuration.
+///
+/// Parses STUN URLs (e.g. `stun:stun.l.google.com:19302`) and resolves
+/// hostnames to socket addresses. Uses blocking DNS resolution, which is
+/// acceptable since this is called once at startup.
+fn resolve_stun_servers(config: &WebRtcConfig) -> Vec<SocketAddr> {
+    use std::net::ToSocketAddrs;
+
+    let mut addrs = Vec::new();
+    for server in &config.ice_servers {
+        for url in &server.urls {
+            // Only handle STUN URLs (not TURN)
+            let host_port = if let Some(rest) = url.strip_prefix("stun:") {
+                rest
+            } else {
+                continue;
+            };
+
+            match host_port.to_socket_addrs() {
+                Ok(resolved) => {
+                    for addr in resolved {
+                        debug!(%addr, url, "resolved STUN server");
+                        addrs.push(addr);
+                    }
+                }
+                Err(e) => {
+                    warn!(url, "failed to resolve STUN server: {e}");
+                }
+            }
+        }
+    }
+    addrs
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -762,8 +932,10 @@ mod tests {
         let (_a_dgram_tx, mut _a_dgram_rx) = mpsc::channel::<(EndpointId, Bytes)>(64);
         let (b_dgram_tx, mut b_dgram_rx) = mpsc::channel(64);
 
-        let mut mgr_a = PeerConnectionManager::new(id_a, a_sig_tx, _a_dgram_tx);
-        let mut mgr_b = PeerConnectionManager::new(id_b, b_sig_tx, b_dgram_tx);
+        let mut mgr_a =
+            PeerConnectionManager::new(id_a, WebRtcConfig::default(), a_sig_tx, _a_dgram_tx);
+        let mut mgr_b =
+            PeerConnectionManager::new(id_b, WebRtcConfig::default(), b_sig_tx, b_dgram_tx);
 
         // A sends to B — triggers connection initiation, queues data
         let waker = std::task::Waker::noop();
@@ -826,9 +998,14 @@ mod tests {
         let (sig_tx, _) = mpsc::channel(64);
         let (dgram_tx, _) = mpsc::channel(64);
 
-        let mut polite_mgr =
-            PeerConnectionManager::new(polite_id, sig_tx.clone(), dgram_tx.clone());
-        let mut impolite_mgr = PeerConnectionManager::new(impolite_id, sig_tx, dgram_tx);
+        let mut polite_mgr = PeerConnectionManager::new(
+            polite_id,
+            WebRtcConfig::default(),
+            sig_tx.clone(),
+            dgram_tx.clone(),
+        );
+        let mut impolite_mgr =
+            PeerConnectionManager::new(impolite_id, WebRtcConfig::default(), sig_tx, dgram_tx);
 
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(&waker);
@@ -872,7 +1049,7 @@ mod tests {
 
         let (sig_tx, mut sig_rx) = mpsc::channel(64);
         let (dgram_tx, _) = mpsc::channel(64);
-        let mut mgr = PeerConnectionManager::new(id_a, sig_tx, dgram_tx);
+        let mut mgr = PeerConnectionManager::new(id_a, WebRtcConfig::default(), sig_tx, dgram_tx);
 
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(&waker);
@@ -947,7 +1124,7 @@ mod tests {
 
         let (sig_tx, mut sig_rx) = mpsc::channel(64);
         let (dgram_tx, _) = mpsc::channel(64);
-        let mut mgr = PeerConnectionManager::new(id, sig_tx, dgram_tx);
+        let mut mgr = PeerConnectionManager::new(id, WebRtcConfig::default(), sig_tx, dgram_tx);
 
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(&waker);
@@ -978,5 +1155,74 @@ mod tests {
                 "SDP must include the default IP ({ip}).\nSDP:\n{sdp}"
             );
         }
+    }
+
+    /// Verifies that mDNS candidates (*.local) are silently skipped.
+    #[tokio::test]
+    async fn test_mdns_candidates_skipped() {
+        let key_a = SecretKey::generate();
+        let key_b = SecretKey::generate();
+        let id_a = key_a.public();
+        let id_b = key_b.public();
+
+        let (sig_tx, _) = mpsc::channel(64);
+        let (dgram_tx, _) = mpsc::channel(64);
+        let mut mgr = PeerConnectionManager::new(id_a, WebRtcConfig::default(), sig_tx, dgram_tx);
+
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        // Initiate a connection to create the peer state
+        let _ = mgr.send(&mut cx, id_b, b"test");
+
+        // mDNS candidate should be silently skipped (Ok, not Err)
+        let mdns_candidate = "candidate:3142169545 1 udp 2113937151 \
+            1f194823-4b59-4e4b-b5e1-78af71b959f4.local 51339 typ host \
+            generation 0 ufrag 3yqk network-cost 999";
+        let result = mgr.handle_ice_candidate(id_b, 0, mdns_candidate, None);
+        assert!(
+            result.is_ok(),
+            "mDNS candidate should be silently skipped, got: {result:?}"
+        );
+
+        // Regular IP candidate should still work
+        let ip_candidate = "candidate:1 1 udp 2130706175 192.168.1.100 5000 typ host";
+        let result = mgr.handle_ice_candidate(id_b, 0, ip_candidate, None);
+        assert!(
+            result.is_ok(),
+            "regular IP candidate should be accepted, got: {result:?}"
+        );
+    }
+
+    /// Verifies that STUN server URLs are parsed and resolved correctly.
+    #[test]
+    fn test_resolve_stun_servers() {
+        // With empty config, no servers
+        let config = WebRtcConfig {
+            ice_servers: vec![],
+        };
+        assert!(resolve_stun_servers(&config).is_empty());
+
+        // TURN URLs should be ignored
+        let config = WebRtcConfig {
+            ice_servers: vec![crate::socket::transports::webrtc::IceServer {
+                urls: vec!["turn:turn.example.com:3478".to_string()],
+                username: None,
+                credential: None,
+            }],
+        };
+        assert!(resolve_stun_servers(&config).is_empty());
+
+        // Valid STUN URL should resolve (127.0.0.1 is always resolvable)
+        let config = WebRtcConfig {
+            ice_servers: vec![crate::socket::transports::webrtc::IceServer {
+                urls: vec!["stun:127.0.0.1:19302".to_string()],
+                username: None,
+                credential: None,
+            }],
+        };
+        let servers = resolve_stun_servers(&config);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0], "127.0.0.1:19302".parse::<SocketAddr>().unwrap());
     }
 }

@@ -11,6 +11,8 @@
 mod browser;
 #[cfg(not(wasm_browser))]
 mod native;
+#[cfg(not(wasm_browser))]
+mod stun;
 
 #[cfg(wasm_browser)]
 pub(crate) use browser::PeerConnectionManager;
