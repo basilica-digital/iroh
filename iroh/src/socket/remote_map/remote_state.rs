@@ -550,6 +550,26 @@ impl RemoteStateActor {
         self.paths.insert_multiple(addrs, Source::App);
         self.paths.resolve_remote(tx);
 
+        // Eagerly register the peer's relay URLs in `relay_mapped_addrs`.
+        // Normally this happens only when `open_path(Addr::Relay(..))` runs,
+        // which may be delayed until after QUIC has selected a path. But the
+        // WebRTC transport's signaling route-resolver (in `forward_outgoing_signaling`)
+        // looks up the peer's relay in this map at the moment it sends the
+        // initial SDP offer — and that happens *before* any relay path is
+        // opened. Without this pre-registration, cross-relay signaling falls
+        // back to our own local relay and is lost.
+        let relay_paths: Vec<_> = self
+            .paths
+            .addrs()
+            .filter_map(|a| match a {
+                transports::Addr::Relay(url, eid) => Some((url.clone(), *eid)),
+                _ => None,
+            })
+            .collect();
+        for key in relay_paths {
+            self.relay_mapped_addrs.get(&key);
+        }
+
         // Open custom transport paths on existing connections immediately.
         // Custom transports (e.g. WebRTC) manage their own connectivity and
         // should be opened as soon as addresses are known, not only when new
