@@ -389,8 +389,8 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 
-    #[test]
-    fn test_sender_validates_transport_id() {
+    #[tokio::test]
+    async fn test_sender_validates_transport_id() {
         let (sig_tx, _) = tokio::sync::mpsc::channel(1);
         let (dgram_tx, _) = tokio::sync::mpsc::channel(1);
         let key = SecretKey::generate();

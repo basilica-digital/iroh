@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     fmt, io,
     net::SocketAddr,
+    pin::Pin,
     task::{Context, Poll, Waker},
     time::Instant,
 };
@@ -35,7 +36,6 @@ use crate::socket::transports::webrtc::{
 const DATA_CHANNEL_LABEL: &str = "iroh-quic";
 
 /// Manages WebRTC peer connections on native platforms using `str0m`.
-#[derive(Debug)]
 pub(crate) struct PeerConnectionManager {
     my_id: EndpointId,
     /// Active peer connections keyed by remote EndpointId.
@@ -48,6 +48,32 @@ pub(crate) struct PeerConnectionManager {
     next_session_id: u64,
     /// Resolved STUN server addresses for server-reflexive candidate gathering.
     stun_servers: Vec<SocketAddr>,
+    /// Timer for the next str0m timeout across all peers.
+    ///
+    /// str0m is a sans-I/O library that drives ICE checks, DTLS handshakes,
+    /// and SCTP retransmits via a timer-based state machine. Without this
+    /// timer, `poll()` would only run when external events arrive (UDP
+    /// packets, signaling), causing ICE checks and DTLS retransmits to stall
+    /// — particularly when the native side is the ICE controlling agent
+    /// (offerer).
+    next_timeout: Pin<Box<tokio::time::Sleep>>,
+    /// Reference point to convert between `std::time::Instant` (used by str0m)
+    /// and `tokio::time::Instant` (used by the timer). Captured once at
+    /// construction.
+    epoch: Instant,
+    /// Tokio epoch matching [`epoch`], for converting str0m instants to tokio instants.
+    tokio_epoch: tokio::time::Instant,
+}
+
+impl fmt::Debug for PeerConnectionManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerConnectionManager")
+            .field("my_id", &self.my_id)
+            .field("peers", &self.peers)
+            .field("next_session_id", &self.next_session_id)
+            .field("stun_servers", &self.stun_servers)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A pending STUN binding request awaiting a response from a STUN server.
@@ -130,6 +156,9 @@ impl PeerConnectionManager {
             );
         }
 
+        let epoch = Instant::now();
+        let tokio_epoch = tokio::time::Instant::now();
+
         Self {
             my_id,
             peers: HashMap::new(),
@@ -137,6 +166,10 @@ impl PeerConnectionManager {
             datagram_tx,
             next_session_id: 0,
             stun_servers,
+            // Start with a far-future timeout; updated when peers are added.
+            next_timeout: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(3600))),
+            epoch,
+            tokio_epoch,
         }
     }
 
@@ -178,6 +211,16 @@ impl PeerConnectionManager {
         let id = self.next_session_id;
         self.next_session_id = self.next_session_id.wrapping_add(1);
         id
+    }
+
+    /// Converts a `std::time::Instant` (used by str0m) to a `tokio::time::Instant`.
+    fn to_tokio_instant(&self, t: Instant) -> tokio::time::Instant {
+        if t > self.epoch {
+            self.tokio_epoch + t.duration_since(self.epoch)
+        } else {
+            // Already in the past — return now so the timer fires immediately.
+            tokio::time::Instant::now()
+        }
     }
 
     /// Sends STUN Binding Requests to all configured STUN servers for a peer's socket.
@@ -508,12 +551,19 @@ impl PeerConnectionManager {
     /// - Read incoming UDP packets and feed them to str0m
     /// - Process str0m outputs (outgoing packets, events)
     /// - Handle DataChannel events
+    /// - Schedule the next wake-up for str0m's timer-driven state machine
     pub(crate) fn poll(&mut self, cx: &mut Context) {
+        // Poll the timer so the waker is registered — this ensures we get
+        // woken even if no external UDP or signaling events arrive.
+        let _ = self.next_timeout.as_mut().poll(cx);
+
         let now = Instant::now();
         let mut events = Vec::new();
         // Collect srflx candidates discovered via STUN to trickle after the loop
         // (can't send signaling while holding a mutable borrow on self.peers).
         let mut trickle_candidates: Vec<(EndpointId, u64, String)> = Vec::new();
+        // Track the earliest next timeout across all peers.
+        let mut earliest_timeout: Option<Instant> = None;
 
         for (peer_id, peer) in &mut self.peers {
             // Read incoming UDP packets.
@@ -630,7 +680,13 @@ impl PeerConnectionManager {
                     Ok(Output::Event(event)) => {
                         events.push((*peer_id, event));
                     }
-                    Ok(Output::Timeout(_)) => break,
+                    Ok(Output::Timeout(t)) => {
+                        earliest_timeout = Some(match earliest_timeout {
+                            Some(prev) => prev.min(t),
+                            None => t,
+                        });
+                        break;
+                    }
                     Err(e) => {
                         warn!(
                             peer = %peer_id.fmt_short(),
@@ -657,6 +713,13 @@ impl PeerConnectionManager {
                     sdp_mid: Some("0".to_string()),
                 },
             });
+        }
+
+        // Schedule wake-up for str0m's next timeout so ICE checks,
+        // DTLS retransmits, and keepalives fire on time.
+        if let Some(t) = earliest_timeout {
+            let tokio_t = self.to_tokio_instant(t);
+            self.next_timeout.as_mut().reset(tokio_t);
         }
     }
 
