@@ -296,7 +296,7 @@ impl Transports {
 
         // Forward outgoing WebRTC signaling through the relay.
         #[cfg(feature = "unstable-webrtc-transport")]
-        self.forward_outgoing_signaling(cx);
+        self.forward_outgoing_signaling(cx, sock);
 
         match self.inner_poll_recv(cx, bufs, metas)? {
             Poll::Pending | Poll::Ready(0) => Poll::Pending,
@@ -571,11 +571,21 @@ impl Transports {
     /// Drains the outgoing signaling channel and sends each message as a tagged
     /// relay datagram to the destination peer.
     ///
-    /// Uses the peer's known relay URL (cached from incoming signaling) when
-    /// available, falling back to the local relay. This enables cross-relay
-    /// WebRTC signaling.
+    /// Destination relay URL is resolved in this order:
+    ///   1. the URL cached from an incoming signaling datagram for this peer,
+    ///   2. the peer's home relay as registered in [`Socket::mapped_addrs`]
+    ///      (populated from the peer's `NodeAddr` when discovery / add_node_addr
+    ///      made the peer reachable),
+    ///   3. our own local relay as a last resort.
+    ///
+    /// (1) and (2) are what makes cross-relay WebRTC signaling work: the
+    /// initial offer from A to B has no cached URL yet, but A already knows B's
+    /// home relay from the `NodeAddr` supplied to `connect`. Falling back to
+    /// (3) is only correct when both peers share a relay; iroh relays do not
+    /// mesh, so signaling sent to A's relay targeting B is dropped when A and
+    /// B are on different relays.
     #[cfg(feature = "unstable-webrtc-transport")]
-    fn forward_outgoing_signaling(&mut self, cx: &mut Context) {
+    fn forward_outgoing_signaling(&mut self, cx: &mut Context, sock: &Socket) {
         let Some(signaling) = &mut self.webrtc_signaling else {
             return;
         };
@@ -593,9 +603,17 @@ impl Transports {
             );
             let payload = webrtc::signaling::encode(&envelope.msg);
 
-            // Use the peer's known relay URL if available (learned from incoming
-            // signaling), otherwise fall back to our local relay.
-            let peer_relay = self.peer_relay_urls.get(&envelope.peer).cloned();
+            // Resolve the peer's relay URL (see doc comment above).
+            let peer_relay = self
+                .peer_relay_urls
+                .get(&envelope.peer)
+                .cloned()
+                .or_else(|| {
+                    sock.mapped_addrs
+                        .relay_addrs
+                        .find_key(|(_, eid)| *eid == envelope.peer)
+                        .map(|(url, _)| url)
+                });
 
             let mut sent = false;
             for relay_transport in &self.relay {
