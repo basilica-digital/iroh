@@ -321,10 +321,10 @@ impl CustomSender for WebRtcSender {
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
         let peer_id = parse_endpoint_id(dst)?;
-        trace!(
+        info!(
             peer = %peer_id.fmt_short(),
             len = transmit.contents.len(),
-            "WebRTC poll_send"
+            "WebRTC poll_send called"
         );
         let mut mgr = self.peer_mgr.lock().expect("poisoned");
 

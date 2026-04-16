@@ -17,7 +17,7 @@ use noq_proto::PathStatus;
 use relay::{RelayNetworkChangeSender, RelaySender};
 use rustc_hash::FxHashMap;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use super::{Socket, mapped_addrs::MultipathMappedAddr};
 use crate::{metrics::EndpointMetrics, net_report::Report};
@@ -1079,10 +1079,19 @@ impl TransportsSender {
                 }
             }
             Addr::Custom(addr) => {
-                for sender in &mut self.custom {
-                    if sender.is_valid_send_addr(addr) {
+                info!(
+                    ?addr,
+                    num_custom_senders = self.custom.len(),
+                    "TransportsSender routing to Custom sender"
+                );
+                for (i, sender) in self.custom.iter().enumerate() {
+                    let valid = sender.is_valid_send_addr(addr);
+                    info!(sender_index = i, valid, "checking custom sender");
+                    if valid {
                         match sender.poll_send(cx, addr, transmit) {
-                            Poll::Pending => {}
+                            Poll::Pending => {
+                                info!(sender_index = i, "custom sender returned Pending");
+                            }
                             Poll::Ready(res) => return Poll::Ready(res),
                         }
                     }
@@ -1230,6 +1239,14 @@ impl noq::UdpSender for Sender {
         // Noq eventually considers the packets that had send errors as lost and will try
         // and re-send them.
         let mapped_addr = self.mapped_addr(noq_transmit)?;
+        // Log all sends at info level to diagnose routing
+        if matches!(&mapped_addr, MultipathMappedAddr::Custom(_)) {
+            info!(
+                dst = ?noq_transmit.destination,
+                ?mapped_addr,
+                "Sender::poll_send identified Custom mapped addr"
+            );
+        }
 
         let transport_addr = match mapped_addr {
             MultipathMappedAddr::Mixed(mapped_addr) => {
@@ -1288,6 +1305,12 @@ impl noq::UdpSender for Sender {
                 }
             }
             MultipathMappedAddr::Custom(custom_mapped_addr) => {
+                info!(
+                    ?custom_mapped_addr,
+                    dst = ?noq_transmit.destination,
+                    len = noq_transmit.contents.len(),
+                    "Sender::poll_send routing to Custom transport"
+                );
                 match self
                     .sock
                     .mapped_addrs
