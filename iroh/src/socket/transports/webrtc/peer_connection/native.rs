@@ -10,7 +10,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll, Waker},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use tokio::io::ReadBuf;
@@ -107,6 +107,17 @@ struct PeerState {
     pending_offer: Option<SdpPendingOffer>,
     /// Pending STUN probes for server-reflexive candidate gathering.
     stun_probes: Vec<StunProbe>,
+    /// Deadline for STUN candidate gathering before sending the SDP offer.
+    ///
+    /// When the native side is the offerer, we defer generating the SDP offer
+    /// until STUN gathering completes (or this deadline expires). This ensures
+    /// the server-reflexive candidate is included directly in the SDP, which
+    /// is critical for NAT traversal: without the srflx address, the remote
+    /// peer can only try our host candidate (a private IP, often unreachable
+    /// across different networks).
+    ///
+    /// `None` means the offer has already been sent (or we are the answerer).
+    stun_gather_deadline: Option<Instant>,
 }
 
 impl fmt::Debug for PeerState {
@@ -121,6 +132,7 @@ impl fmt::Debug for PeerState {
             .field("pending_sends", &self.pending_sends)
             .field("pending_offer", &self.pending_offer.as_ref().map(|_| ".."))
             .field("stun_probes", &self.stun_probes)
+            .field("stun_gather_deadline", &self.stun_gather_deadline)
             .finish()
     }
 }
@@ -254,7 +266,19 @@ impl PeerConnectionManager {
         probes
     }
 
+    /// Maximum time to wait for STUN responses before sending the SDP offer.
+    ///
+    /// This is deliberately short: STUN responses typically arrive in <20ms.
+    /// We just need enough time for one RTT to the STUN server, not a full
+    /// ICE gathering timeout.
+    const STUN_GATHER_TIMEOUT: Duration = Duration::from_millis(200);
+
     /// Initiates a connection to a remote peer (we are the offerer).
+    ///
+    /// The SDP offer is NOT sent immediately. Instead, STUN probes are fired
+    /// and the offer is deferred until gathering completes (or times out) in
+    /// [`poll()`]. This ensures the server-reflexive candidate is included in
+    /// the SDP, which is critical for cross-network NAT traversal.
     fn initiate(&mut self, peer_id: EndpointId) -> io::Result<()> {
         if self.peers.contains_key(&peer_id) {
             return Ok(());
@@ -264,42 +288,32 @@ impl PeerConnectionManager {
         let socket = Self::bind_socket()?;
         let local_addr = socket.local_addr()?;
 
-        let mut rtc = Self::create_rtc();
+        let rtc = Self::create_rtc();
 
-        // Add our local socket as an ICE host candidate
-        if let Ok(candidate) = Candidate::host(local_addr, "udp") {
-            rtc.add_local_candidate(candidate);
-        }
+        // Start STUN probes for server-reflexive candidate discovery.
+        // The host candidate and DataChannel will be added to the Rtc when
+        // the SDP offer is generated (after gathering completes in poll()).
+        let stun_probes = self.send_stun_probes(&socket);
 
-        // Create DataChannel (as offerer) and generate SDP offer
-        let mut changes = rtc.sdp_api();
-        changes.add_channel_with_config(ChannelConfig {
-            label: DATA_CHANNEL_LABEL.to_string(),
-            ordered: false,
-            reliability: Reliability::MaxRetransmits { retransmits: 0 },
-            ..Default::default()
-        });
-        let (offer, pending) = changes
-            .apply()
-            .expect("should have pending changes from data channel creation");
-        let sdp = offer.to_sdp_string();
+        // Set the gather deadline so poll() will generate the SDP offer:
+        // - If no STUN probes were sent (no servers configured or all failed),
+        //   fire the offer on the next poll() (deadline = now).
+        // - Otherwise, give STUN servers up to STUN_GATHER_TIMEOUT to respond
+        //   before sending the offer.
+        let now = Instant::now();
+        let stun_gather_deadline = if stun_probes.is_empty() {
+            Some(now)
+        } else {
+            Some(now + Self::STUN_GATHER_TIMEOUT)
+        };
 
         info!(
             peer = %peer_id.fmt_short(),
             session_id,
             local_addr = %local_addr,
-            "initiating WebRTC connection (native offerer)"
+            stun_probes = stun_probes.len(),
+            "initiating WebRTC connection (native offerer), gathering STUN candidates"
         );
-
-        // Start STUN probes for server-reflexive candidate discovery.
-        // The srflx candidate will be trickled via signaling when the
-        // STUN response arrives in poll().
-        let stun_probes = self.send_stun_probes(&socket);
-
-        let _ = self.signaling_tx.try_send(SignalingEnvelope {
-            peer: peer_id,
-            msg: SignalingMsg::Offer { session_id, sdp },
-        });
 
         self.peers.insert(
             peer_id,
@@ -311,8 +325,9 @@ impl PeerConnectionManager {
                 state: ConnectionState::Connecting,
                 send_waker: None,
                 pending_sends: Vec::new(),
-                pending_offer: Some(pending),
+                pending_offer: None, // Deferred until STUN gathering completes
                 stun_probes,
+                stun_gather_deadline,
             },
         );
 
@@ -397,6 +412,7 @@ impl PeerConnectionManager {
                 pending_sends: Vec::new(),
                 pending_offer: None,
                 stun_probes,
+                stun_gather_deadline: None, // Answerer sends SDP immediately
             },
         );
 
@@ -562,6 +578,8 @@ impl PeerConnectionManager {
         // Collect srflx candidates discovered via STUN to trickle after the loop
         // (can't send signaling while holding a mutable borrow on self.peers).
         let mut trickle_candidates: Vec<(EndpointId, u64, String)> = Vec::new();
+        // Peers whose deferred SDP offer should now be generated and sent.
+        let mut deferred_offers: Vec<EndpointId> = Vec::new();
         // Track the earliest next timeout across all peers.
         let mut earliest_timeout: Option<Instant> = None;
 
@@ -600,11 +618,17 @@ impl PeerConnectionManager {
                                         peer = %peer_id.fmt_short(),
                                         %mapped_addr,
                                         %local_addr,
+                                        offer_deferred = peer.stun_gather_deadline.is_some(),
                                         "discovered server-reflexive candidate via STUN"
                                     );
-                                    let sdp = candidate.to_sdp_string();
+                                    // Only trickle if the SDP offer was already sent.
+                                    // If the offer is deferred (stun_gather_deadline is set),
+                                    // the candidate will be included in the SDP directly.
+                                    if peer.stun_gather_deadline.is_none() {
+                                        let sdp = candidate.to_sdp_string();
+                                        trickle_candidates.push((*peer_id, peer.session_id, sdp));
+                                    }
                                     peer.rtc.add_local_candidate(candidate);
-                                    trickle_candidates.push((*peer_id, peer.session_id, sdp));
                                 }
                             }
                             peer.stun_probes.swap_remove(probe_idx);
@@ -696,6 +720,21 @@ impl PeerConnectionManager {
                     }
                 }
             }
+
+            // If this peer has a deferred SDP offer, check whether gathering is
+            // complete (all probes responded) or the deadline has passed.
+            // Otherwise, fold the deadline into `earliest_timeout` so the timer
+            // wakes us up at the right moment to send the offer.
+            if let Some(deadline) = peer.stun_gather_deadline {
+                if peer.stun_probes.is_empty() || now >= deadline {
+                    deferred_offers.push(*peer_id);
+                } else {
+                    earliest_timeout = Some(match earliest_timeout {
+                        Some(prev) => prev.min(deadline),
+                        None => deadline,
+                    });
+                }
+            }
         }
 
         // Process events outside the borrow of self.peers
@@ -715,12 +754,98 @@ impl PeerConnectionManager {
             });
         }
 
+        // Generate deferred SDP offers for peers whose STUN gathering has
+        // finished (either all probes responded or the deadline expired).
+        // By the time we reach here, any srflx candidates discovered via STUN
+        // have already been added to the Rtc via `add_local_candidate` above,
+        // so they will be included in the generated offer alongside the host
+        // candidate — eliminating the trickle-ICE race that was causing the
+        // Mac→iPhone failure across NATs.
+        for peer_id in deferred_offers {
+            self.send_deferred_offer(peer_id);
+        }
+
         // Schedule wake-up for str0m's next timeout so ICE checks,
         // DTLS retransmits, and keepalives fire on time.
         if let Some(t) = earliest_timeout {
             let tokio_t = self.to_tokio_instant(t);
             self.next_timeout.as_mut().reset(tokio_t);
         }
+    }
+
+    /// Generates and sends the deferred SDP offer for a peer whose STUN
+    /// gathering has completed (or timed out).
+    ///
+    /// This adds the host candidate to the Rtc, creates the DataChannel via
+    /// `sdp_api()`, emits the offer SDP, and sends it through the signaling
+    /// channel. Any srflx candidates discovered before this point are already
+    /// present on the Rtc and will be embedded in the SDP.
+    fn send_deferred_offer(&mut self, peer_id: EndpointId) {
+        let Some(peer) = self.peers.get_mut(&peer_id) else {
+            return;
+        };
+
+        // Defensive: if the deadline was already cleared, don't re-send.
+        if peer.stun_gather_deadline.is_none() {
+            return;
+        }
+
+        let local_addr = match peer.socket.local_addr() {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(
+                    peer = %peer_id.fmt_short(),
+                    "cannot read local_addr for deferred offer: {e}"
+                );
+                return;
+            }
+        };
+
+        // Add the host candidate. It was not added in `initiate()` because we
+        // wanted to defer Rtc state mutation until offer-generation time.
+        if let Ok(candidate) = Candidate::host(local_addr, "udp") {
+            peer.rtc.add_local_candidate(candidate);
+        }
+
+        // Build the DataChannel and generate the SDP offer.
+        let mut changes = peer.rtc.sdp_api();
+        changes.add_channel_with_config(ChannelConfig {
+            label: DATA_CHANNEL_LABEL.to_string(),
+            ordered: false,
+            reliability: Reliability::MaxRetransmits { retransmits: 0 },
+            ..Default::default()
+        });
+        let (offer, pending) = match changes.apply() {
+            Some(pair) => pair,
+            None => {
+                warn!(
+                    peer = %peer_id.fmt_short(),
+                    "sdp_api().apply() returned None — no changes to apply"
+                );
+                peer.stun_gather_deadline = None;
+                return;
+            }
+        };
+        let sdp = offer.to_sdp_string();
+
+        let gathered_srflx = peer.stun_probes.is_empty();
+        info!(
+            peer = %peer_id.fmt_short(),
+            session_id = peer.session_id,
+            local_addr = %local_addr,
+            stun_probes_remaining = peer.stun_probes.len(),
+            gathered_srflx,
+            "sending deferred SDP offer with gathered ICE candidates"
+        );
+
+        peer.pending_offer = Some(pending);
+        peer.stun_gather_deadline = None;
+
+        let session_id = peer.session_id;
+        let _ = self.signaling_tx.try_send(SignalingEnvelope {
+            peer: peer_id,
+            msg: SignalingMsg::Offer { session_id, sdp },
+        });
     }
 
     /// Handles a str0m event for a specific peer.
@@ -1112,7 +1237,12 @@ mod tests {
 
         let (sig_tx, mut sig_rx) = mpsc::channel(64);
         let (dgram_tx, _) = mpsc::channel(64);
-        let mut mgr = PeerConnectionManager::new(id_a, WebRtcConfig::default(), sig_tx, dgram_tx);
+        // Use an empty ice_servers list so STUN gathering is trivially "done"
+        // and the deferred SDP offer is emitted on the first poll().
+        let cfg = WebRtcConfig {
+            ice_servers: vec![],
+        };
+        let mut mgr = PeerConnectionManager::new(id_a, cfg, sig_tx, dgram_tx);
 
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(&waker);
@@ -1120,6 +1250,9 @@ mod tests {
         // First send — initiates connection
         let err = mgr.send(&mut cx, id_b, b"first").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        // Drive poll() once to generate and send the deferred SDP offer.
+        mgr.poll(&mut cx);
 
         // Drain the signaling offer
         let envelope = sig_rx.try_recv().expect("should have offer");
@@ -1134,6 +1267,9 @@ mod tests {
         // Second send — should re-initiate with a new session
         let err = mgr.send(&mut cx, id_b, b"second").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        // Drive poll() again to generate and send the new deferred SDP offer.
+        mgr.poll(&mut cx);
 
         let envelope = sig_rx.try_recv().expect("should have new offer");
         let session_2 = match &envelope.msg {
@@ -1187,7 +1323,12 @@ mod tests {
 
         let (sig_tx, mut sig_rx) = mpsc::channel(64);
         let (dgram_tx, _) = mpsc::channel(64);
-        let mut mgr = PeerConnectionManager::new(id, WebRtcConfig::default(), sig_tx, dgram_tx);
+        // Empty ice_servers makes STUN gathering trivially complete so the
+        // deferred SDP offer is emitted on the first poll().
+        let cfg = WebRtcConfig {
+            ice_servers: vec![],
+        };
+        let mut mgr = PeerConnectionManager::new(id, cfg, sig_tx, dgram_tx);
 
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(&waker);
@@ -1195,8 +1336,9 @@ mod tests {
         let peer_key = SecretKey::generate();
         let peer_id = peer_key.public();
 
-        // Trigger initiate to generate an offer
+        // Trigger initiate, then drive poll() to emit the deferred offer.
         let _ = mgr.send(&mut cx, peer_id, b"test");
+        mgr.poll(&mut cx);
 
         let envelope = sig_rx.try_recv().expect("should have offer");
         let sdp = match &envelope.msg {
