@@ -61,28 +61,23 @@ async fn main() -> Result<()> {
     // Spawn background acceptor
     let ep = endpoint.clone();
     let accept_handle = tokio::spawn(async move {
-        loop {
-            match ep.accept().await {
-                Some(incoming) => {
-                    let conn = match incoming.await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("Accept error: {e}");
-                            continue;
-                        }
-                    };
-                    let remote = conn.remote_id().fmt_short().to_string();
-                    println!("Accepted connection from {remote}");
-                    print_paths(&conn);
-
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_connection(conn).await {
-                            eprintln!("Connection error with {remote}: {e}");
-                        }
-                    });
+        while let Some(incoming) = ep.accept().await {
+            let conn = match incoming.await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Accept error: {e}");
+                    continue;
                 }
-                None => break,
-            }
+            };
+            let remote = conn.remote_id().fmt_short().to_string();
+            println!("Accepted connection from {remote}");
+            print_paths(&conn);
+
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(conn).await {
+                    eprintln!("Connection error with {remote}: {e}");
+                }
+            });
         }
     });
 

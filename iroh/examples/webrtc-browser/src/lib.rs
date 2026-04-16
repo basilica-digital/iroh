@@ -87,33 +87,26 @@ pub async fn init() -> Result<String, JsValue> {
     let ep = endpoint.clone();
     task::spawn(async move {
         log("Listening for incoming connections...");
-        loop {
-            match ep.accept().await {
-                Some(incoming) => {
-                    let conn = match incoming.await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            log(&format!("Accept error: {e}"));
-                            continue;
-                        }
-                    };
-                    let remote = conn.remote_id().fmt_short().to_string();
-                    log(&format!("Accepted connection from {remote}"));
-                    log_paths(&conn);
+        while let Some(incoming) = ep.accept().await {
+            let conn = match incoming.await {
+                Ok(c) => c,
+                Err(e) => {
+                    log(&format!("Accept error: {e}"));
+                    continue;
+                }
+            };
+            let remote = conn.remote_id().fmt_short().to_string();
+            log(&format!("Accepted connection from {remote}"));
+            log_paths(&conn);
 
-                    task::spawn(async move {
-                        match handle_connection(conn).await {
-                            Ok(()) => log(&format!("Connection with {remote} closed")),
-                            Err(e) => log(&format!("Connection error with {remote}: {e}")),
-                        }
-                    });
+            task::spawn(async move {
+                match handle_connection(conn).await {
+                    Ok(()) => log(&format!("Connection with {remote} closed")),
+                    Err(e) => log(&format!("Connection error with {remote}: {e}")),
                 }
-                None => {
-                    log("Endpoint closed, stopping accept loop");
-                    break;
-                }
-            }
+            });
         }
+        log("Endpoint closed, stopping accept loop");
     });
 
     ENDPOINT
