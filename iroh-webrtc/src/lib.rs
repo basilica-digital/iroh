@@ -73,7 +73,7 @@ use tokio::sync::mpsc;
 
 pub use crate::{
     addr::{WEBRTC_TRANSPORT_ID, to_custom_addr},
-    config::{IceServer, WebRtcConfig},
+    config::{IceServer, RetryConfig, WebRtcConfig},
     signaling::{SignalingEnvelope, SignalingMsg},
     transport::WebRtcTransport,
 };
@@ -160,5 +160,19 @@ impl WebRtc {
     /// [`Self::attach_iroh_signaling`].
     pub fn take_outgoing_rx(&self) -> Option<mpsc::Receiver<SignalingEnvelope>> {
         self.from_transport_rx.lock().expect("poisoned").take()
+    }
+
+    /// Notifies the transport of a network-change event.
+    ///
+    /// Mirrors QUIC's hole-punch retry behavior: when the local link or IP
+    /// changes (e.g. Wi-Fi ↔ cellular roam), WebRTC peers that are stuck in
+    /// exponential backoff get re-armed so the next send attempt retries
+    /// immediately. When `major = true`, even active peers are torn down so
+    /// they re-gather ICE candidates from the new local address.
+    ///
+    /// This is a best-effort nudge — calls are silently dropped if the
+    /// transport is not yet bound or the internal control channel is full.
+    pub fn on_network_change(&self, major: bool) {
+        self.transport.on_network_change(major);
     }
 }

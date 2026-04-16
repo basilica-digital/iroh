@@ -42,6 +42,18 @@ use crate::{
     signaling::{SignalingEnvelope, SignalingMsg},
 };
 
+/// Out-of-band messages used by [`WebRtc::on_network_change`] to kick the
+/// bound endpoint's reconnect state machine. Delivered over a dedicated mpsc
+/// channel so the transport can be driven without holding a direct handle to
+/// the [`PeerConnectionManager`] (which is created at bind time).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Control {
+    /// A network-change notification. `major = true` means the local address
+    /// or link changed (forces teardown of active peers); `major = false`
+    /// only nudges peers that are currently in backoff.
+    NetworkChange { major: bool },
+}
+
 /// Bundled signaling channel ends stashed inside the transport until
 /// [`CustomTransport::bind`] is called.
 ///
@@ -53,6 +65,7 @@ type ChannelSlot = Arc<
         Option<(
             mpsc::Receiver<SignalingEnvelope>,
             mpsc::Sender<SignalingEnvelope>,
+            mpsc::Receiver<Control>,
         )>,
     >,
 >;
@@ -66,6 +79,9 @@ pub struct WebRtcTransport {
     secret_key: SecretKey,
     config: WebRtcConfig,
     channels: ChannelSlot,
+    /// Sender for out-of-band control messages. Clones deliver into the same
+    /// receiver owned by the bound endpoint.
+    control_tx: mpsc::Sender<Control>,
 }
 
 impl WebRtcTransport {
@@ -87,20 +103,38 @@ impl WebRtcTransport {
         signaling_incoming_rx: mpsc::Receiver<SignalingEnvelope>,
         signaling_outgoing_tx: mpsc::Sender<SignalingEnvelope>,
     ) -> Self {
+        let (control_tx, control_rx) = mpsc::channel(16);
         Self {
             secret_key,
             config,
             channels: Arc::new(Mutex::new(Some((
                 signaling_incoming_rx,
                 signaling_outgoing_tx,
+                control_rx,
             )))),
+            control_tx,
+        }
+    }
+
+    /// Notifies the bound endpoint of a network-change event.
+    ///
+    /// - `major = true` tears down all active WebRTC peers and re-negotiates
+    ///   from scratch. Use this when the local IP or link state changes.
+    /// - `major = false` only re-arms peers currently in exponential backoff,
+    ///   letting them retry immediately.
+    ///
+    /// Must be called after [`CustomTransport::bind`] — before binding there
+    /// is no endpoint to receive the event, and the call is silently dropped.
+    pub fn on_network_change(&self, major: bool) {
+        if let Err(e) = self.control_tx.try_send(Control::NetworkChange { major }) {
+            debug!("WebRtcTransport::on_network_change: control channel send failed: {e}");
         }
     }
 }
 
 impl CustomTransport for WebRtcTransport {
     fn bind(&self) -> io::Result<Box<dyn CustomEndpoint>> {
-        let (signaling_incoming_rx, signaling_outgoing_tx) = self
+        let (signaling_incoming_rx, signaling_outgoing_tx, control_rx) = self
             .channels
             .lock()
             .expect("poisoned")
@@ -122,6 +156,7 @@ impl CustomTransport for WebRtcTransport {
             peer_mgr: Arc::new(Mutex::new(peer_mgr)),
             signaling_incoming_rx,
             datagram_rx,
+            control_rx,
         };
 
         debug!("WebRTC transport bound for {}", my_id.fmt_short());
@@ -142,6 +177,9 @@ pub(crate) struct WebRtcEndpoint {
     signaling_incoming_rx: mpsc::Receiver<SignalingEnvelope>,
     /// Datagrams received from peer DataChannels.
     datagram_rx: mpsc::Receiver<(EndpointId, Bytes)>,
+    /// Out-of-band control messages from the [`WebRtcTransport`] factory
+    /// (e.g. network-change notifications).
+    control_rx: mpsc::Receiver<Control>,
 }
 
 impl WebRtcEndpoint {
@@ -240,6 +278,17 @@ impl CustomEndpoint for WebRtcEndpoint {
 
         // Drive signaling state machine
         self.process_signaling(cx);
+
+        // Drain out-of-band control messages (e.g. network-change notifications).
+        while let Poll::Ready(Some(ctrl)) = self.control_rx.poll_recv(cx) {
+            match ctrl {
+                Control::NetworkChange { major } => {
+                    debug!(major, "WebRTC: applying network-change control event");
+                    let mut mgr = self.peer_mgr.lock().expect("poisoned");
+                    mgr.on_network_change(major);
+                }
+            }
+        }
 
         // Drive the peer connection manager (native only — handles I/O polling)
         {

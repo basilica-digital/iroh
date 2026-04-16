@@ -28,7 +28,7 @@ use tracing::{debug, info, trace, warn};
 
 use super::stun;
 use crate::{
-    config::WebRtcConfig,
+    config::{RetryConfig, WebRtcConfig},
     signaling::{SignalingEnvelope, SignalingMsg},
 };
 
@@ -48,6 +48,8 @@ pub(crate) struct PeerConnectionManager {
     next_session_id: u64,
     /// Resolved STUN server addresses for server-reflexive candidate gathering.
     stun_servers: Vec<SocketAddr>,
+    /// Retry backoff configuration for failed peer connections.
+    retry_cfg: RetryConfig,
     /// Timer for the next str0m timeout across all peers.
     ///
     /// str0m is a sans-I/O library that drives ICE checks, DTLS handshakes,
@@ -56,6 +58,9 @@ pub(crate) struct PeerConnectionManager {
     /// packets, signaling), causing ICE checks and DTLS retransmits to stall
     /// — particularly when the native side is the ICE controlling agent
     /// (offerer).
+    ///
+    /// The timer also fires when the earliest `Failed::next_retry_at` is
+    /// reached, so retry-on-backoff wake-ups are driven by the same path.
     next_timeout: Pin<Box<tokio::time::Sleep>>,
     /// Reference point to convert between `std::time::Instant` (used by str0m)
     /// and `tokio::time::Instant` (used by the timer). Captured once at
@@ -107,6 +112,14 @@ struct PeerState {
     pending_offer: Option<SdpPendingOffer>,
     /// Pending STUN probes for server-reflexive candidate gathering.
     stun_probes: Vec<StunProbe>,
+    /// Mapped addresses reported by STUN servers during gathering. When
+    /// multiple probes return different mapped ports, the local NAT is
+    /// almost certainly symmetric — direct ICE cannot punch it, and the
+    /// transport will eventually abandon direct attempts in favor of relay.
+    stun_mapped_addrs: Vec<SocketAddr>,
+    /// Whether a symmetric-NAT warning has already been emitted for this
+    /// peer. Avoids log spam when multiple probe responses arrive in sequence.
+    symmetric_nat_logged: bool,
     /// Deadline for STUN candidate gathering before sending the SDP offer.
     ///
     /// When the native side is the offerer, we defer generating the SDP offer
@@ -118,6 +131,11 @@ struct PeerState {
     ///
     /// `None` means the offer has already been sent (or we are the answerer).
     stun_gather_deadline: Option<Instant>,
+    /// Number of consecutive connection failures. Incremented each time a
+    /// connection transitions into [`ConnectionState::Failed`]; reset to 0
+    /// when the DataChannel opens (see [`handle_event`]). Used to compute
+    /// the exponential backoff for the next retry.
+    failure_attempts: u32,
 }
 
 impl fmt::Debug for PeerState {
@@ -132,7 +150,9 @@ impl fmt::Debug for PeerState {
             .field("pending_sends", &self.pending_sends)
             .field("pending_offer", &self.pending_offer.as_ref().map(|_| ".."))
             .field("stun_probes", &self.stun_probes)
+            .field("stun_mapped_addrs", &self.stun_mapped_addrs)
             .field("stun_gather_deadline", &self.stun_gather_deadline)
+            .field("failure_attempts", &self.failure_attempts)
             .finish()
     }
 }
@@ -144,8 +164,10 @@ enum ConnectionState {
     Connecting,
     /// DataChannel is open and ready for data.
     Connected,
-    /// Connection failed or was closed.
-    Closed,
+    /// Last attempt failed. A retry is scheduled at `next_retry_at`; if
+    /// `None`, the peer is parked until an external event (network change)
+    /// re-arms it.
+    Failed { next_retry_at: Option<Instant> },
 }
 
 impl PeerConnectionManager {
@@ -178,11 +200,32 @@ impl PeerConnectionManager {
             datagram_tx,
             next_session_id: 0,
             stun_servers,
+            retry_cfg: config.retry,
             // Start with a far-future timeout; updated when peers are added.
             next_timeout: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(3600))),
             epoch,
             tokio_epoch,
         }
+    }
+
+    /// Computes the backoff delay before the `attempts`th retry.
+    ///
+    /// `attempts` starts at 1 for the first retry after a failure. The delay
+    /// grows as `initial_backoff * 2^(attempts-1)` and saturates at
+    /// `max_backoff`. If `attempts` exceeds [`RetryConfig::max_attempts`], the
+    /// peer is parked (no scheduled retry).
+    fn failure_next_retry_at(&self, attempts: u32, now: Instant) -> Option<Instant> {
+        if attempts == 0 || attempts > self.retry_cfg.max_attempts {
+            return None;
+        }
+        let shift = attempts.saturating_sub(1).min(31);
+        let factor = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+        let base = self.retry_cfg.initial_backoff;
+        let delay = base
+            .checked_mul(factor)
+            .unwrap_or(self.retry_cfg.max_backoff)
+            .min(self.retry_cfg.max_backoff);
+        Some(now + delay)
     }
 
     /// Creates a new str0m `Rtc` instance.
@@ -268,18 +311,43 @@ impl PeerConnectionManager {
 
     /// Maximum time to wait for STUN responses before sending the SDP offer.
     ///
-    /// This is deliberately short: STUN responses typically arrive in <20ms.
-    /// We just need enough time for one RTT to the STUN server, not a full
-    /// ICE gathering timeout.
-    const STUN_GATHER_TIMEOUT: Duration = Duration::from_millis(200);
+    /// Responses from well-provisioned STUN servers typically arrive in
+    /// <50ms, but mobile links and long-haul networks routinely push this
+    /// past 200ms. We trade a small startup-latency budget for a much
+    /// higher chance of including the server-reflexive candidate in the
+    /// first offer — missing it is what forces a trickle-ICE race that
+    /// often manifests as "connects on Wi-Fi, fails on LTE".
+    const STUN_GATHER_TIMEOUT: Duration = Duration::from_millis(800);
 
-    /// Initiates a connection to a remote peer (we are the offerer).
+    /// Initiates a fresh connection to a remote peer (we are the offerer).
+    ///
+    /// Preserves no state from any prior failed attempt — callers recovering
+    /// from a failure should use [`retry_connect`] so the failure counter is
+    /// carried forward.
     ///
     /// The SDP offer is NOT sent immediately. Instead, STUN probes are fired
     /// and the offer is deferred until gathering completes (or times out) in
     /// [`poll()`]. This ensures the server-reflexive candidate is included in
     /// the SDP, which is critical for cross-network NAT traversal.
     fn initiate(&mut self, peer_id: EndpointId) -> io::Result<()> {
+        self.begin_offer(peer_id, 0)
+    }
+
+    /// Tears down an existing failed peer and starts a new offer, carrying
+    /// the failure counter forward so exponential backoff keeps growing.
+    fn retry_connect(&mut self, peer_id: EndpointId) -> io::Result<()> {
+        let prior_attempts = self
+            .peers
+            .get(&peer_id)
+            .map(|p| p.failure_attempts)
+            .unwrap_or(0);
+        self.peers.remove(&peer_id);
+        self.begin_offer(peer_id, prior_attempts)
+    }
+
+    /// Inserts a fresh `PeerState` for `peer_id` as the offerer, preserving
+    /// the supplied `failure_attempts` counter.
+    fn begin_offer(&mut self, peer_id: EndpointId, failure_attempts: u32) -> io::Result<()> {
         if self.peers.contains_key(&peer_id) {
             return Ok(());
         }
@@ -312,6 +380,7 @@ impl PeerConnectionManager {
             session_id,
             local_addr = %local_addr,
             stun_probes = stun_probes.len(),
+            failure_attempts,
             "initiating WebRTC connection (native offerer), gathering STUN candidates"
         );
 
@@ -327,7 +396,10 @@ impl PeerConnectionManager {
                 pending_sends: Vec::new(),
                 pending_offer: None, // Deferred until STUN gathering completes
                 stun_probes,
+                stun_mapped_addrs: Vec::new(),
+                symmetric_nat_logged: false,
                 stun_gather_deadline,
+                failure_attempts,
             },
         );
 
@@ -341,25 +413,42 @@ impl PeerConnectionManager {
         session_id: u64,
         sdp: &str,
     ) -> io::Result<()> {
-        // Glare resolution: if we already have a pending connection to this peer,
-        // the peer with the smaller EndpointId yields (is "polite").
-        if let Some(existing) = self.peers.get(&peer_id)
-            && existing.state == ConnectionState::Connecting
-        {
-            if self.my_id < peer_id {
-                // We are polite: roll back our offer, accept theirs
-                debug!(
-                    peer = %peer_id.fmt_short(),
-                    "glare detected, yielding as polite peer"
-                );
-                self.peers.remove(&peer_id);
-            } else {
-                // We are impolite: ignore their offer
-                debug!(
-                    peer = %peer_id.fmt_short(),
-                    "glare detected, ignoring offer as impolite peer"
-                );
-                return Ok(());
+        // Decide what to do based on existing peer state:
+        //  - Connecting: classic glare; polite peer (smaller id) yields,
+        //    impolite peer ignores the offer and keeps its own outgoing one.
+        //  - Connected / Failed: remote is reconnecting (fresh ICE session
+        //    after a network change, for instance). Drop our stale state and
+        //    accept the new offer.
+        let mut prior_attempts: u32 = 0;
+        if let Some(existing) = self.peers.get(&peer_id) {
+            match existing.state {
+                ConnectionState::Connecting => {
+                    if self.my_id < peer_id {
+                        debug!(
+                            peer = %peer_id.fmt_short(),
+                            "glare detected, yielding as polite peer"
+                        );
+                        prior_attempts = existing.failure_attempts;
+                        self.peers.remove(&peer_id);
+                    } else {
+                        debug!(
+                            peer = %peer_id.fmt_short(),
+                            "glare detected, ignoring offer as impolite peer"
+                        );
+                        return Ok(());
+                    }
+                }
+                ConnectionState::Connected | ConnectionState::Failed { .. } => {
+                    debug!(
+                        peer = %peer_id.fmt_short(),
+                        existing_session = existing.session_id,
+                        incoming_session = session_id,
+                        state = ?existing.state,
+                        "remote is reconnecting; replacing existing session"
+                    );
+                    prior_attempts = existing.failure_attempts;
+                    self.peers.remove(&peer_id);
+                }
             }
         }
 
@@ -412,7 +501,10 @@ impl PeerConnectionManager {
                 pending_sends: Vec::new(),
                 pending_offer: None,
                 stun_probes,
+                stun_mapped_addrs: Vec::new(),
+                symmetric_nat_logged: false,
                 stun_gather_deadline: None, // Answerer sends SDP immediately
+                failure_attempts: prior_attempts,
             },
         );
 
@@ -549,14 +641,116 @@ impl PeerConnectionManager {
                 peer.send_waker = Some(cx.waker().clone());
                 Err(io::Error::from(io::ErrorKind::WouldBlock))
             }
-            ConnectionState::Closed => {
-                // Remove the failed connection and try to initiate a new one
-                self.peers.remove(&peer_id);
-                self.initiate(peer_id)?;
-                let peer = self.peers.get_mut(&peer_id).expect("just inserted");
-                peer.pending_sends.push(Bytes::copy_from_slice(data));
-                peer.send_waker = Some(cx.waker().clone());
-                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            ConnectionState::Failed { next_retry_at } => {
+                let now = Instant::now();
+                match next_retry_at {
+                    Some(t) if now >= t => {
+                        // Backoff elapsed — tear down and start a fresh offer.
+                        self.retry_connect(peer_id)?;
+                        let peer = self.peers.get_mut(&peer_id).expect("just inserted");
+                        peer.pending_sends.push(Bytes::copy_from_slice(data));
+                        peer.send_waker = Some(cx.waker().clone());
+                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                    }
+                    Some(_) => {
+                        // Still within backoff window — register waker; poll()
+                        // will fire it when the deadline arrives.
+                        peer.send_waker = Some(cx.waker().clone());
+                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                    }
+                    None => {
+                        // Parked (retry budget exhausted). Report failure so
+                        // QUIC stops holding this path open; the peer will be
+                        // re-armed by [`on_network_change`].
+                        Err(io::Error::other(
+                            "WebRTC retry budget exhausted; awaiting network change",
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Transitions the peer to [`ConnectionState::Failed`] and schedules the
+    /// next retry according to the configured backoff.
+    ///
+    /// Returns the peer's scheduled retry instant (if any) so callers can fold
+    /// it into timer wake-ups.
+    fn mark_failed(&mut self, peer_id: EndpointId) -> Option<Instant> {
+        let attempts = {
+            let peer = self.peers.get_mut(&peer_id)?;
+            peer.failure_attempts = peer.failure_attempts.saturating_add(1);
+            peer.failure_attempts
+        };
+        let next_retry_at = self.failure_next_retry_at(attempts, Instant::now());
+        let peer = self
+            .peers
+            .get_mut(&peer_id)
+            .expect("peer just observed above");
+        peer.state = ConnectionState::Failed { next_retry_at };
+        match next_retry_at {
+            Some(when) => info!(
+                peer = %peer_id.fmt_short(),
+                attempts,
+                backoff_ms = when.saturating_duration_since(Instant::now()).as_millis() as u64,
+                "WebRTC connection failed; scheduling retry"
+            ),
+            None => warn!(
+                peer = %peer_id.fmt_short(),
+                attempts,
+                "WebRTC retry budget exhausted; parking peer until network change"
+            ),
+        }
+        if let Some(waker) = peer.send_waker.take() {
+            waker.wake();
+        }
+        next_retry_at
+    }
+
+    /// Kicks retry timers in response to an external network-change event.
+    ///
+    /// - For `major` changes (IP change, link state flip), all peers are torn
+    ///   down and re-initiated with a fresh attempt counter. This mirrors
+    ///   iroh's QUIC hole-punch retry on major network events.
+    /// - For minor changes, only peers currently in [`ConnectionState::Failed`]
+    ///   are re-armed: their backoff is cleared so the next `send()` retries
+    ///   immediately. Parked peers (retry budget exhausted) also get a fresh
+    ///   attempt counter.
+    pub(crate) fn on_network_change(&mut self, major: bool) {
+        let peer_ids: Vec<EndpointId> = self.peers.keys().copied().collect();
+        for peer_id in peer_ids {
+            let Some(peer) = self.peers.get_mut(&peer_id) else {
+                continue;
+            };
+            match (peer.state, major) {
+                (ConnectionState::Failed { .. }, _) => {
+                    debug!(
+                        peer = %peer_id.fmt_short(),
+                        major,
+                        "network change: re-arming failed WebRTC peer"
+                    );
+                    peer.failure_attempts = 0;
+                    self.peers.remove(&peer_id);
+                    if let Err(e) = self.begin_offer(peer_id, 0) {
+                        warn!(peer = %peer_id.fmt_short(), "retry after network change failed: {e}");
+                    }
+                }
+                (ConnectionState::Connecting | ConnectionState::Connected, true) => {
+                    debug!(
+                        peer = %peer_id.fmt_short(),
+                        "major network change: tearing down active WebRTC peer to re-negotiate"
+                    );
+                    peer.failure_attempts = 0;
+                    let waker = peer.send_waker.take();
+                    self.peers.remove(&peer_id);
+                    if let Err(e) = self.begin_offer(peer_id, 0) {
+                        warn!(peer = %peer_id.fmt_short(), "re-negotiation after network change failed: {e}");
+                    }
+                    if let Some(w) = waker {
+                        w.wake();
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -610,6 +804,28 @@ impl PeerConnectionManager {
                                     .socket
                                     .local_addr()
                                     .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+
+                                // Record this mapped address and check if a
+                                // prior probe returned a *different* port.
+                                // Two probes to different STUN servers should
+                                // get the same mapping on cone NATs; a
+                                // mismatch means the NAT is symmetric and ICE
+                                // without TURN/relay cannot succeed.
+                                if !peer.symmetric_nat_logged
+                                    && peer
+                                        .stun_mapped_addrs
+                                        .iter()
+                                        .any(|prev| prev.port() != mapped_addr.port())
+                                {
+                                    warn!(
+                                        peer = %peer_id.fmt_short(),
+                                        existing = ?peer.stun_mapped_addrs,
+                                        new = %mapped_addr,
+                                        "symmetric NAT detected — WebRTC direct connectivity is unlikely, relay will be required"
+                                    );
+                                    peer.symmetric_nat_logged = true;
+                                }
+                                peer.stun_mapped_addrs.push(mapped_addr);
 
                                 if let Ok(candidate) =
                                     Candidate::server_reflexive(mapped_addr, local_addr, "udp")
@@ -728,6 +944,26 @@ impl PeerConnectionManager {
             if let Some(deadline) = peer.stun_gather_deadline {
                 if peer.stun_probes.is_empty() || now >= deadline {
                     deferred_offers.push(*peer_id);
+                } else {
+                    earliest_timeout = Some(match earliest_timeout {
+                        Some(prev) => prev.min(deadline),
+                        None => deadline,
+                    });
+                }
+            }
+
+            // Fold `Failed::next_retry_at` into the timer so we wake up at the
+            // backoff deadline; wake any registered send_waker whose deadline
+            // has already passed so the next poll of `CustomSender::poll_send`
+            // actually runs and triggers the retry.
+            if let ConnectionState::Failed {
+                next_retry_at: Some(deadline),
+            } = peer.state
+            {
+                if now >= deadline {
+                    if let Some(waker) = peer.send_waker.take() {
+                        waker.wake();
+                    }
                 } else {
                     earliest_timeout = Some(match earliest_timeout {
                         Some(prev) => prev.min(deadline),
@@ -863,9 +1099,11 @@ impl PeerConnectionManager {
                             // ICE is connected, but we wait for the DataChannel to open
                         }
                         IceConnectionState::Disconnected => {
-                            peer.state = ConnectionState::Closed;
-                            if let Some(waker) = peer.send_waker.take() {
-                                waker.wake();
+                            // Only mark Failed if we weren't already Failed.
+                            // Avoid stacking backoff increments on repeated
+                            // Disconnected events for the same session.
+                            if !matches!(peer.state, ConnectionState::Failed { .. }) {
+                                self.mark_failed(peer_id);
                             }
                         }
                         _ => {}
@@ -881,6 +1119,9 @@ impl PeerConnectionManager {
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.channel_id = Some(channel_id);
                     peer.state = ConnectionState::Connected;
+                    // Reset backoff on a successful connect so the next failure
+                    // restarts the exponential schedule from scratch.
+                    peer.failure_attempts = 0;
 
                     // Flush pending sends
                     let pending: Vec<_> = peer.pending_sends.drain(..).collect();
@@ -910,11 +1151,16 @@ impl PeerConnectionManager {
                     peer = %peer_id.fmt_short(),
                     "DataChannel closed"
                 );
-                if let Some(peer) = self.peers.get_mut(&peer_id)
-                    && peer.channel_id == Some(channel_id)
-                {
-                    peer.channel_id = None;
-                    peer.state = ConnectionState::Closed;
+                let should_mark_failed = matches!(
+                    self.peers.get(&peer_id),
+                    Some(p) if p.channel_id == Some(channel_id)
+                        && !matches!(p.state, ConnectionState::Failed { .. })
+                );
+                if should_mark_failed {
+                    if let Some(peer) = self.peers.get_mut(&peer_id) {
+                        peer.channel_id = None;
+                    }
+                    self.mark_failed(peer_id);
                 }
             }
             _ => {
@@ -1241,6 +1487,7 @@ mod tests {
         // and the deferred SDP offer is emitted on the first poll().
         let cfg = WebRtcConfig {
             ice_servers: vec![],
+            ..WebRtcConfig::default()
         };
         let mut mgr = PeerConnectionManager::new(id_a, cfg, sig_tx, dgram_tx);
 
@@ -1327,6 +1574,7 @@ mod tests {
         // deferred SDP offer is emitted on the first poll().
         let cfg = WebRtcConfig {
             ice_servers: vec![],
+            ..WebRtcConfig::default()
         };
         let mut mgr = PeerConnectionManager::new(id, cfg, sig_tx, dgram_tx);
 
@@ -1405,6 +1653,7 @@ mod tests {
         // With empty config, no servers
         let config = WebRtcConfig {
             ice_servers: vec![],
+            ..WebRtcConfig::default()
         };
         assert!(resolve_stun_servers(&config).is_empty());
 
@@ -1415,6 +1664,7 @@ mod tests {
                 username: None,
                 credential: None,
             }],
+            ..WebRtcConfig::default()
         };
         assert!(resolve_stun_servers(&config).is_empty());
 
@@ -1425,6 +1675,7 @@ mod tests {
                 username: None,
                 credential: None,
             }],
+            ..WebRtcConfig::default()
         };
         let servers = resolve_stun_servers(&config);
         assert_eq!(servers.len(), 1);

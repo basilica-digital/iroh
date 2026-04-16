@@ -24,7 +24,7 @@ use web_sys::{
 };
 
 use crate::{
-    config::WebRtcConfig,
+    config::{RetryConfig, WebRtcConfig},
     signaling::{SignalingEnvelope, SignalingMsg},
 };
 
@@ -127,6 +127,7 @@ fn summarize_sdp_candidates(sdp: &str) -> String {
 pub(crate) struct PeerConnectionManager {
     my_id: EndpointId,
     config: WebRtcConfig,
+    retry_cfg: RetryConfig,
     /// Active peer connections keyed by remote EndpointId.
     peers: HashMap<EndpointId, PeerState>,
     /// Channel to send signaling messages outward (to relay).
@@ -175,8 +176,19 @@ struct PeerState {
     /// so we queue candidates here and flush them once the description is applied.
     /// Shared with the async block that applies the remote description.
     pending_remote_candidates: PendingCandidates,
+    /// Number of consecutive connection failures. Used to compute exponential
+    /// backoff. Reset to 0 when the DataChannel opens successfully.
+    failure_attempts: u32,
+    /// Sender for the peer's event channel. Kept so that JS `setTimeout`
+    /// callbacks (e.g. retry wake-ups) can inject an event that wakes up
+    /// [`poll()`].
+    event_tx: mpsc::Sender<PeerEvent>,
     /// Closures we need to keep alive for the JS callbacks.
     _closures: Vec<Closure<dyn FnMut(JsValue)>>,
+    /// `setTimeout` closures kept alive for pending retry wake-ups. We keep the
+    /// Closure here rather than using `.forget()` so it is dropped when the
+    /// peer is removed.
+    _timeout_closures: Vec<Closure<dyn FnMut()>>,
 }
 
 impl std::fmt::Debug for PeerState {
@@ -190,14 +202,17 @@ impl std::fmt::Debug for PeerState {
 }
 
 /// Connection lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum ConnectionState {
     /// ICE/DTLS handshake in progress.
     Connecting,
     /// DataChannel is open and ready for data.
     Connected,
-    /// Connection failed or was closed.
-    Closed,
+    /// Connection failed. `next_retry_at_ms` is a `Date.now()` deadline
+    /// (ms since epoch) at which the next attempt is allowed; `None` means
+    /// the peer is parked until an external event (network change) re-arms
+    /// it.
+    Failed { next_retry_at_ms: Option<f64> },
 }
 
 /// Events from JavaScript callbacks, pushed into a channel.
@@ -213,6 +228,10 @@ enum PeerEvent {
     DataChannelOpen,
     /// DataChannel closed.
     DataChannelClose,
+    /// A scheduled retry backoff has elapsed. Solely used to wake up
+    /// [`poll()`] so it re-checks the `Failed` state and fires the send
+    /// waker.
+    RetryTick,
 }
 
 impl PeerConnectionManager {
@@ -223,14 +242,32 @@ impl PeerConnectionManager {
         signaling_tx: mpsc::Sender<SignalingEnvelope>,
         datagram_tx: mpsc::Sender<(EndpointId, Bytes)>,
     ) -> Self {
+        let retry_cfg = config.retry.clone();
         Self {
             my_id,
             config,
+            retry_cfg,
             peers: HashMap::new(),
             signaling_tx,
             datagram_tx,
             next_session_id: 0,
         }
+    }
+
+    /// Computes the `Date.now()`-style deadline for the `attempts`th retry.
+    ///
+    /// Returns `None` when the retry budget is exhausted and the peer should
+    /// be parked.
+    fn failure_next_retry_at_ms(&self, attempts: u32) -> Option<f64> {
+        if attempts == 0 || attempts > self.retry_cfg.max_attempts {
+            return None;
+        }
+        let shift = attempts.saturating_sub(1).min(31);
+        let factor = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+        let base_ms = self.retry_cfg.initial_backoff.as_millis() as f64;
+        let max_ms = self.retry_cfg.max_backoff.as_millis() as f64;
+        let delay = (base_ms * factor as f64).min(max_ms);
+        Some(js_sys::Date::now() + delay)
     }
 
     /// Creates a browser `RtcConfiguration` from our ICE server config.
@@ -431,11 +468,33 @@ impl PeerConnectionManager {
         id
     }
 
-    /// Initiates a connection to a remote peer (we are the offerer).
+    /// Initiates a fresh connection to a remote peer (we are the offerer).
+    ///
+    /// Preserves no state from any prior failed attempt; callers recovering
+    /// from failure should use [`retry_connect`] so the failure counter is
+    /// carried forward.
+    fn initiate(&mut self, peer_id: EndpointId) -> io::Result<()> {
+        self.begin_offer(peer_id, 0)
+    }
+
+    /// Tears down an existing failed peer and starts a new offer, carrying
+    /// the failure counter forward so exponential backoff keeps growing.
+    fn retry_connect(&mut self, peer_id: EndpointId) -> io::Result<()> {
+        let prior_attempts = self
+            .peers
+            .get(&peer_id)
+            .map(|p| p.failure_attempts)
+            .unwrap_or(0);
+        self.peers.remove(&peer_id);
+        self.begin_offer(peer_id, prior_attempts)
+    }
+
+    /// Inserts a fresh `PeerState` for `peer_id` as the offerer, preserving
+    /// the supplied `failure_attempts` counter.
     ///
     /// This spawns an async task to create the offer since browser WebRTC APIs
     /// are promise-based.
-    fn initiate(&mut self, peer_id: EndpointId) -> io::Result<()> {
+    fn begin_offer(&mut self, peer_id: EndpointId, failure_attempts: u32) -> io::Result<()> {
         if self.peers.contains_key(&peer_id) {
             return Ok(());
         }
@@ -534,7 +593,10 @@ impl PeerConnectionManager {
                 event_rx,
                 remote_desc_set: Rc::new(Cell::new(false)),
                 pending_remote_candidates: Rc::new(RefCell::new(Vec::new())),
+                failure_attempts,
+                event_tx,
                 _closures: closures,
+                _timeout_closures: Vec::new(),
             },
         );
 
@@ -548,26 +610,46 @@ impl PeerConnectionManager {
         session_id: u64,
         sdp: &str,
     ) -> io::Result<()> {
-        // Glare resolution: peer with smaller EndpointId yields
-        if let Some(existing) = self.peers.get(&peer_id)
-            && existing.state == ConnectionState::Connecting
-        {
-            if self.my_id < peer_id {
-                debug!(
-                    peer = %peer_id.fmt_short(),
-                    "glare detected, yielding as polite peer"
-                );
-                self.peers.remove(&peer_id);
-            } else {
-                debug!(
-                    peer = %peer_id.fmt_short(),
-                    "glare detected, ignoring offer as impolite peer"
-                );
-                return Ok(());
+        // Decide what to do based on existing peer state:
+        //  - Connecting: classic glare; polite peer (smaller id) yields,
+        //    impolite peer ignores the offer and keeps its own outgoing one.
+        //  - Connected / Failed: remote is reconnecting (fresh ICE session
+        //    after a network change, for instance). Drop our stale state and
+        //    accept the new offer.
+        let mut prior_attempts: u32 = 0;
+        if let Some(existing) = self.peers.get(&peer_id) {
+            match existing.state {
+                ConnectionState::Connecting => {
+                    if self.my_id < peer_id {
+                        debug!(
+                            peer = %peer_id.fmt_short(),
+                            "glare detected, yielding as polite peer"
+                        );
+                        prior_attempts = existing.failure_attempts;
+                        self.peers.remove(&peer_id);
+                    } else {
+                        debug!(
+                            peer = %peer_id.fmt_short(),
+                            "glare detected, ignoring offer as impolite peer"
+                        );
+                        return Ok(());
+                    }
+                }
+                ConnectionState::Connected | ConnectionState::Failed { .. } => {
+                    debug!(
+                        peer = %peer_id.fmt_short(),
+                        existing_session = existing.session_id,
+                        incoming_session = session_id,
+                        state = ?existing.state,
+                        "remote is reconnecting; replacing existing session"
+                    );
+                    prior_attempts = existing.failure_attempts;
+                    self.peers.remove(&peer_id);
+                }
             }
         }
 
-        let (pc, _event_tx, event_rx, remote_channel, closures) =
+        let (pc, event_tx, event_rx, remote_channel, closures) =
             self.create_peer_connection(peer_id, session_id)?;
 
         debug_record(format!(
@@ -707,7 +789,10 @@ impl PeerConnectionManager {
                 event_rx,
                 remote_desc_set,
                 pending_remote_candidates,
+                failure_attempts: prior_attempts,
+                event_tx,
                 _closures: closures,
+                _timeout_closures: Vec::new(),
             },
         );
 
@@ -925,13 +1010,138 @@ impl PeerConnectionManager {
                 peer.send_waker = Some(cx.waker().clone());
                 Err(io::Error::from(io::ErrorKind::WouldBlock))
             }
-            ConnectionState::Closed => {
-                self.peers.remove(&peer_id);
-                self.initiate(peer_id)?;
-                let peer = self.peers.get_mut(&peer_id).expect("just inserted");
-                peer.pending_sends.push(Bytes::copy_from_slice(data));
-                peer.send_waker = Some(cx.waker().clone());
-                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            ConnectionState::Failed { next_retry_at_ms } => {
+                let now_ms = js_sys::Date::now();
+                match next_retry_at_ms {
+                    Some(t) if now_ms >= t => {
+                        // Backoff elapsed — tear down and start a fresh offer.
+                        self.retry_connect(peer_id)?;
+                        let peer = self.peers.get_mut(&peer_id).expect("just inserted");
+                        peer.pending_sends.push(Bytes::copy_from_slice(data));
+                        peer.send_waker = Some(cx.waker().clone());
+                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                    }
+                    Some(_) => {
+                        // Still within backoff window — register waker; the
+                        // `setTimeout` scheduled in `mark_failed` will deliver
+                        // a `RetryTick` that wakes `poll()` at the deadline.
+                        peer.send_waker = Some(cx.waker().clone());
+                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                    }
+                    None => {
+                        // Parked (retry budget exhausted). Report failure so
+                        // QUIC stops holding this path open; the peer will be
+                        // re-armed by [`on_network_change`].
+                        Err(io::Error::other(
+                            "WebRTC retry budget exhausted; awaiting network change",
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Transitions the peer to [`ConnectionState::Failed`] and schedules the
+    /// next retry according to the configured backoff.
+    ///
+    /// Schedules a `setTimeout` that emits a [`PeerEvent::RetryTick`], which
+    /// wakes up [`poll()`] so it can fire the peer's send-waker and trigger
+    /// the next send attempt.
+    ///
+    /// Returns the `Date.now()` deadline (if any) so callers can decide
+    /// whether a retry was scheduled or the peer is parked.
+    fn mark_failed(&mut self, peer_id: EndpointId) -> Option<f64> {
+        let attempts = {
+            let peer = self.peers.get_mut(&peer_id)?;
+            peer.failure_attempts = peer.failure_attempts.saturating_add(1);
+            peer.failure_attempts
+        };
+        let next_retry_at_ms = self.failure_next_retry_at_ms(attempts);
+        let peer = self
+            .peers
+            .get_mut(&peer_id)
+            .expect("peer just observed above");
+        peer.state = ConnectionState::Failed { next_retry_at_ms };
+        match next_retry_at_ms {
+            Some(when) => {
+                let delay_ms = (when - js_sys::Date::now()).max(0.0) as i32;
+                debug_record(format!(
+                    "[{peer}] WebRTC failed; retry in {delay_ms}ms (attempt {attempts})",
+                    peer = peer_id.fmt_short()
+                ));
+                // Schedule a setTimeout that sends RetryTick to wake poll().
+                let tx = peer.event_tx.clone();
+                let closure = Closure::wrap(Box::new(move || {
+                    let _ = tx.try_send(PeerEvent::RetryTick);
+                }) as Box<dyn FnMut()>);
+                if let Some(win) = web_sys::window()
+                    && let Err(e) = win.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        closure.as_ref().unchecked_ref(),
+                        delay_ms,
+                    )
+                {
+                    warn!(
+                        peer = %peer_id.fmt_short(),
+                        "failed to schedule WebRTC retry setTimeout: {e:?}"
+                    );
+                }
+                peer._timeout_closures.push(closure);
+            }
+            None => {
+                warn!(
+                    peer = %peer_id.fmt_short(),
+                    attempts,
+                    "WebRTC retry budget exhausted; parking peer until network change"
+                );
+            }
+        }
+        if let Some(waker) = peer.send_waker.take() {
+            waker.wake();
+        }
+        next_retry_at_ms
+    }
+
+    /// Kicks retry timers in response to an external network-change event.
+    ///
+    /// - For `major` changes (IP change, link state flip), all peers are torn
+    ///   down and re-initiated with a fresh attempt counter. This mirrors
+    ///   iroh's QUIC hole-punch retry on major network events.
+    /// - For minor changes, only peers currently in [`ConnectionState::Failed`]
+    ///   are re-armed: the failure counter is reset and a fresh offer is
+    ///   started so the next `send()` retries immediately.
+    pub(crate) fn on_network_change(&mut self, major: bool) {
+        let peer_ids: Vec<EndpointId> = self.peers.keys().copied().collect();
+        for peer_id in peer_ids {
+            let Some(peer) = self.peers.get_mut(&peer_id) else {
+                continue;
+            };
+            match (peer.state, major) {
+                (ConnectionState::Failed { .. }, _) => {
+                    debug!(
+                        peer = %peer_id.fmt_short(),
+                        major,
+                        "network change: re-arming failed WebRTC peer"
+                    );
+                    self.peers.remove(&peer_id);
+                    if let Err(e) = self.begin_offer(peer_id, 0) {
+                        warn!(peer = %peer_id.fmt_short(), "retry after network change failed: {e}");
+                    }
+                }
+                (ConnectionState::Connecting | ConnectionState::Connected, true) => {
+                    debug!(
+                        peer = %peer_id.fmt_short(),
+                        "major network change: tearing down active WebRTC peer to re-negotiate"
+                    );
+                    let waker = peer.send_waker.take();
+                    self.peers.remove(&peer_id);
+                    if let Err(e) = self.begin_offer(peer_id, 0) {
+                        warn!(peer = %peer_id.fmt_short(), "re-negotiation after network change failed: {e}");
+                    }
+                    if let Some(w) = waker {
+                        w.wake();
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -945,6 +1155,10 @@ impl PeerConnectionManager {
     /// than waiting for unrelated activity to trigger a poll cycle.
     pub(crate) fn poll(&mut self, cx: &mut Context) {
         let peer_ids: Vec<EndpointId> = self.peers.keys().copied().collect();
+        // Peers that should transition into Failed after event processing.
+        // Collected here to avoid reentrant mutable borrows of self.peers.
+        let mut fail: Vec<EndpointId> = Vec::new();
+
         for peer_id in peer_ids {
             let Some(peer) = self.peers.get_mut(&peer_id) else {
                 continue;
@@ -965,6 +1179,15 @@ impl PeerConnectionManager {
                                 peer = peer_id.fmt_short()
                             ));
                             peer.state = ConnectionState::Connected;
+                            // Reset backoff on a successful connect so the next
+                            // failure restarts the exponential schedule from
+                            // scratch.
+                            peer.failure_attempts = 0;
+                            // Once connected, previous retry closures are
+                            // irrelevant. Dropping them is purely hygiene —
+                            // their callbacks have already fired or will fire
+                            // into a stale channel.
+                            peer._timeout_closures.clear();
 
                             // On the answerer side, the DataChannel arrives via
                             // the ondatachannel JS callback which stores it in
@@ -995,7 +1218,9 @@ impl PeerConnectionManager {
                                 peer = %peer_id.fmt_short(),
                                 "DataChannel closed"
                             );
-                            peer.state = ConnectionState::Closed;
+                            if !matches!(peer.state, ConnectionState::Failed { .. }) {
+                                fail.push(peer_id);
+                            }
                         }
                         PeerEvent::IceConnectionStateChange(state_str) => {
                             debug!(
@@ -1003,18 +1228,53 @@ impl PeerConnectionManager {
                                 state = %state_str,
                                 "ICE connection state changed"
                             );
-                            if state_str.contains("failed") || state_str.contains("disconnected") {
-                                peer.state = ConnectionState::Closed;
+                            if (state_str.contains("failed") || state_str.contains("disconnected"))
+                                && !matches!(peer.state, ConnectionState::Failed { .. })
+                            {
+                                fail.push(peer_id);
+                            }
+                        }
+                        PeerEvent::RetryTick => {
+                            // Just a wake-up tick. If the deadline has passed,
+                            // wake the send waker so the next `send()` retries.
+                            if let ConnectionState::Failed {
+                                next_retry_at_ms: Some(deadline),
+                            } = peer.state
+                                && js_sys::Date::now() >= deadline
+                                && let Some(waker) = peer.send_waker.take()
+                            {
+                                waker.wake();
                             }
                         }
                     },
                     Poll::Ready(None) => {
-                        peer.state = ConnectionState::Closed;
+                        // Event channel closed unexpectedly — treat as failure.
+                        if !matches!(peer.state, ConnectionState::Failed { .. }) {
+                            fail.push(peer_id);
+                        }
                         break;
                     }
                     Poll::Pending => break,
                 }
             }
+
+            // Also check retry deadlines that may have elapsed without a
+            // RetryTick (e.g. if the browser timer fired before the channel
+            // was polled). This keeps wake-ups reliable without an extra
+            // dependency on the tick firing.
+            if let ConnectionState::Failed {
+                next_retry_at_ms: Some(deadline),
+            } = peer.state
+                && js_sys::Date::now() >= deadline
+                && let Some(waker) = peer.send_waker.take()
+            {
+                waker.wake();
+            }
+        }
+
+        // Apply deferred failure transitions.
+        for peer_id in fail {
+            self.mark_failed(peer_id);
         }
     }
 }
