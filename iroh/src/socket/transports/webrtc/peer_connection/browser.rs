@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     io,
     rc::Rc,
-    task::{Context, Waker},
+    task::{Context, Poll, Waker},
 };
 
 use bytes::Bytes;
@@ -602,6 +602,9 @@ impl PeerConnectionManager {
     ///
     /// JS callbacks push events into per-peer channels. This method drains
     /// those channels and transitions `ConnectionState` accordingly.
+    /// Using `poll_recv(cx)` registers the waker so the task is woken
+    /// immediately when JS callbacks fire (e.g. DataChannelOpen), rather
+    /// than waiting for unrelated activity to trigger a poll cycle.
     pub(crate) fn poll(&mut self, cx: &mut Context) {
         let peer_ids: Vec<EndpointId> = self.peers.keys().copied().collect();
         for peer_id in peer_ids {
@@ -611,8 +614,8 @@ impl PeerConnectionManager {
 
             // Drain all pending events for this peer.
             loop {
-                match peer.event_rx.try_recv() {
-                    Ok(event) => match event {
+                match peer.event_rx.poll_recv(cx) {
+                    Poll::Ready(Some(event)) => match event {
                         PeerEvent::DataChannelOpen => {
                             debug!(
                                 peer = %peer_id.fmt_short(),
@@ -670,11 +673,11 @@ impl PeerConnectionManager {
                             // ICE candidates are sent directly from the JS callback.
                         }
                     },
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                    Poll::Ready(None) => {
                         peer.state = ConnectionState::Closed;
                         break;
                     }
+                    Poll::Pending => break,
                 }
             }
         }
