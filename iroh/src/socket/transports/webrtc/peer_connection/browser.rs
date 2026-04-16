@@ -348,20 +348,33 @@ impl PeerConnectionManager {
         let signaling_tx = self.signaling_tx.clone();
         let pc_clone = pc.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let offer = wasm_bindgen_futures::JsFuture::from(pc_clone.create_offer())
-                .await
-                .expect("create_offer failed");
+            let offer = match wasm_bindgen_futures::JsFuture::from(pc_clone.create_offer()).await {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!(?e, "create_offer failed");
+                    return;
+                }
+            };
 
-            let offer_sdp = Reflect::get(&offer, &"sdp".into())
-                .expect("no sdp in offer")
-                .as_string()
-                .expect("sdp is not a string");
+            let offer_sdp = match Reflect::get(&offer, &"sdp".into())
+                .ok()
+                .and_then(|v| v.as_string())
+            {
+                Some(sdp) => sdp,
+                None => {
+                    warn!("offer missing sdp string");
+                    return;
+                }
+            };
 
             let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
             desc.set_sdp(&offer_sdp);
-            wasm_bindgen_futures::JsFuture::from(pc_clone.set_local_description(&desc))
-                .await
-                .expect("set_local_description failed");
+            if let Err(e) =
+                wasm_bindgen_futures::JsFuture::from(pc_clone.set_local_description(&desc)).await
+            {
+                warn!(?e, "set_local_description failed for offer");
+                return;
+            }
 
             let _ = signaling_tx
                 .send(SignalingEnvelope {
@@ -434,24 +447,42 @@ impl PeerConnectionManager {
         wasm_bindgen_futures::spawn_local(async move {
             let mut offer_desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
             offer_desc.set_sdp(&sdp_owned);
-            wasm_bindgen_futures::JsFuture::from(pc_clone.set_remote_description(&offer_desc))
-                .await
-                .expect("set_remote_description failed");
+            if let Err(e) =
+                wasm_bindgen_futures::JsFuture::from(pc_clone.set_remote_description(&offer_desc))
+                    .await
+            {
+                warn!(?e, "set_remote_description failed for offer");
+                return;
+            }
 
-            let answer = wasm_bindgen_futures::JsFuture::from(pc_clone.create_answer())
-                .await
-                .expect("create_answer failed");
+            let answer = match wasm_bindgen_futures::JsFuture::from(pc_clone.create_answer()).await
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(?e, "create_answer failed");
+                    return;
+                }
+            };
 
-            let answer_sdp = Reflect::get(&answer, &"sdp".into())
-                .expect("no sdp in answer")
-                .as_string()
-                .expect("sdp is not a string");
+            let answer_sdp = match Reflect::get(&answer, &"sdp".into())
+                .ok()
+                .and_then(|v| v.as_string())
+            {
+                Some(sdp) => sdp,
+                None => {
+                    warn!("answer missing sdp string");
+                    return;
+                }
+            };
 
             let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
             desc.set_sdp(&answer_sdp);
-            wasm_bindgen_futures::JsFuture::from(pc_clone.set_local_description(&desc))
-                .await
-                .expect("set_local_description failed");
+            if let Err(e) =
+                wasm_bindgen_futures::JsFuture::from(pc_clone.set_local_description(&desc)).await
+            {
+                warn!(?e, "set_local_description failed for answer");
+                return;
+            }
 
             let _ = signaling_tx
                 .send(SignalingEnvelope {
@@ -503,9 +534,11 @@ impl PeerConnectionManager {
         wasm_bindgen_futures::spawn_local(async move {
             let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
             desc.set_sdp(&sdp_owned);
-            wasm_bindgen_futures::JsFuture::from(pc_clone.set_remote_description(&desc))
-                .await
-                .expect("set_remote_description failed");
+            if let Err(e) =
+                wasm_bindgen_futures::JsFuture::from(pc_clone.set_remote_description(&desc)).await
+            {
+                warn!(?e, "set_remote_description failed for answer");
+            }
         });
 
         Ok(())
