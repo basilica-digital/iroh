@@ -22,19 +22,29 @@
 //! prints the active transport path after each exchange so you can watch
 //! the relay → WebRTC transition happen.
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn main() {}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::io::Write as _;
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, Watcher,
     endpoint::{Connection, presets},
 };
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use iroh_base::SecretKey;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use iroh_webrtc::{SIGNALING_ALPN, WebRtc, WebRtcConfig};
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use n0_error::{Result, StdResultExt};
 
 /// Must match the browser example's ALPN.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 const ALPN: &[u8] = b"iroh-example/webrtc-chat/0";
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -151,6 +161,7 @@ async fn main() -> Result<()> {
 }
 
 /// Prints all network paths for a connection, highlighting the selected one.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 fn print_paths(conn: &Connection) {
     let mut paths = conn.paths();
     let path_list = paths.get();
@@ -183,6 +194,7 @@ fn print_paths(conn: &Connection) {
 }
 
 /// Handles an accepted connection: reads messages and echoes them back.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 async fn handle_connection(conn: Connection) -> Result<()> {
     loop {
         let (mut send, mut recv) = conn.accept_bi().await.anyerr()?;

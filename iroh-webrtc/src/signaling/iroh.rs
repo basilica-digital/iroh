@@ -27,10 +27,8 @@ use iroh::{
     endpoint::{Connection, HandshakeCompleted},
 };
 use iroh_base::{EndpointAddr, EndpointId};
-use tokio::{
-    sync::{Mutex, mpsc},
-    task::{AbortHandle, JoinHandle},
-};
+use n0_future::task::{self, AbortHandle, JoinHandle};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, trace, warn};
 
 use crate::signaling::{SignalingEnvelope, SignalingMsg, decode, encode};
@@ -102,7 +100,7 @@ impl IrohSignaling {
         });
 
         let dispatch_inner = inner.clone();
-        let dispatch_handle = tokio::spawn(async move {
+        let dispatch_handle = task::spawn(async move {
             while let Some(env) = outgoing_rx.recv().await {
                 if let Err(e) = dispatch_inner.send_outbound(env).await {
                     warn!("iroh-webrtc signaling dispatch failed: {e:#}");
@@ -127,7 +125,7 @@ impl IrohSignaling {
     /// [`Self::handle_new_peer_conn`].
     pub fn handle_incoming(&self, conn: Connection<HandshakeCompleted>) {
         let inner = self.inner.clone();
-        tokio::spawn(async move {
+        task::spawn(async move {
             let peer = conn.remote_id();
             if let Err(e) = inner.handle_new_peer_conn(peer, conn, false).await {
                 warn!(peer = %peer.fmt_short(), "signaling incoming setup failed: {e:#}");
@@ -210,14 +208,14 @@ impl Inner {
 
         let writer_inner = self.clone();
         let writer_peer = peer;
-        let writer = tokio::spawn(async move {
+        let writer = task::spawn(async move {
             writer_loop(writer_inner, writer_peer, send, out_rx).await;
         })
         .abort_handle();
 
         let reader_inner = self.clone();
         let reader_peer = peer;
-        let reader = tokio::spawn(async move {
+        let reader = task::spawn(async move {
             reader_loop(reader_inner, reader_peer, recv).await;
         })
         .abort_handle();
