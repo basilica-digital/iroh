@@ -31,7 +31,7 @@ use bytes::Bytes;
 use iroh_base::{CustomAddr, EndpointId, SecretKey};
 use n0_watcher::Watchable;
 use tokio::sync::mpsc;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use self::{
     peer_connection::PeerConnectionManager,
@@ -90,6 +90,9 @@ impl Default for WebRtcConfig {
 #[derive(Debug, Clone)]
 pub struct WebRtcTransport {
     secret_key: SecretKey,
+    // Used on browser for ICE server configuration; native str0m doesn't
+    // support configurable ICE servers yet.
+    #[cfg_attr(not(wasm_browser), allow(dead_code))]
     config: WebRtcConfig,
 }
 
@@ -116,13 +119,13 @@ impl WebRtcTransport {
 
         let peer_mgr = PeerConnectionManager::new(
             my_id,
+            #[cfg(wasm_browser)]
             self.config.clone(),
             signaling_outgoing_tx,
             datagram_tx,
         );
 
         let endpoint = WebRtcEndpoint {
-            my_id,
             addrs: Watchable::new(vec![to_custom_addr(my_id)]),
             peer_mgr: Arc::new(Mutex::new(peer_mgr)),
             signaling_incoming_rx,
@@ -158,7 +161,6 @@ fn parse_endpoint_id(addr: &CustomAddr) -> io::Result<EndpointId> {
 /// and WebRTC DataChannels.
 #[derive(Debug)]
 pub(crate) struct WebRtcEndpoint {
-    my_id: EndpointId,
     addrs: Watchable<Vec<CustomAddr>>,
     peer_mgr: Arc<Mutex<PeerConnectionManager>>,
 
@@ -177,7 +179,7 @@ impl WebRtcEndpoint {
             let mut mgr = self.peer_mgr.lock().expect("poisoned");
             match &envelope.msg {
                 SignalingMsg::Offer { session_id, sdp } => {
-                    info!(
+                    debug!(
                         peer = %envelope.peer.fmt_short(),
                         session_id,
                         "received WebRTC offer via signaling"
@@ -190,7 +192,7 @@ impl WebRtcEndpoint {
                     }
                 }
                 SignalingMsg::Answer { session_id, sdp } => {
-                    info!(
+                    debug!(
                         peer = %envelope.peer.fmt_short(),
                         session_id,
                         "received WebRTC answer via signaling"
@@ -207,7 +209,7 @@ impl WebRtcEndpoint {
                     candidate,
                     sdp_mid,
                 } => {
-                    info!(
+                    debug!(
                         peer = %envelope.peer.fmt_short(),
                         session_id,
                         %candidate,
@@ -321,11 +323,6 @@ impl CustomSender for WebRtcSender {
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
         let peer_id = parse_endpoint_id(dst)?;
-        info!(
-            peer = %peer_id.fmt_short(),
-            len = transmit.contents.len(),
-            "WebRTC poll_send called"
-        );
         let mut mgr = self.peer_mgr.lock().expect("poisoned");
 
         // Split into individual datagrams if GSO segments are present.
@@ -401,12 +398,7 @@ mod tests {
         let (sig_tx, _) = tokio::sync::mpsc::channel(1);
         let (dgram_tx, _) = tokio::sync::mpsc::channel(1);
         let key = SecretKey::generate();
-        let mgr = peer_connection::PeerConnectionManager::new(
-            key.public(),
-            WebRtcConfig::default(),
-            sig_tx,
-            dgram_tx,
-        );
+        let mgr = peer_connection::PeerConnectionManager::new(key.public(), sig_tx, dgram_tx);
         let sender = WebRtcSender {
             peer_mgr: Arc::new(std::sync::Mutex::new(mgr)),
         };

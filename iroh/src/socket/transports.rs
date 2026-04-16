@@ -17,7 +17,7 @@ use noq_proto::PathStatus;
 use relay::{RelayNetworkChangeSender, RelaySender};
 use rustc_hash::FxHashMap;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 
 use super::{Socket, mapped_addrs::MultipathMappedAddr};
 use crate::{metrics::EndpointMetrics, net_report::Report};
@@ -237,6 +237,11 @@ impl Transports {
                 }
                 #[cfg(feature = "unstable-webrtc-transport")]
                 TransportConfig::WebRtc(webrtc_cfg) => {
+                    if relay.is_empty() {
+                        warn!("WebRTC transport requires relay for signaling, skipping");
+                        continue;
+                    }
+
                     // Create signaling channels for relay ↔ WebRTC communication
                     let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(64);
                     let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel(64);
@@ -248,12 +253,10 @@ impl Transports {
                     let endpoint = transport.bind_with_signaling(incoming_rx, outgoing_tx)?;
                     custom.push(endpoint);
 
-                    if !relay.is_empty() {
-                        webrtc_signaling = Some(webrtc::SignalingChannel {
-                            incoming_tx,
-                            outgoing_rx,
-                        });
-                    }
+                    webrtc_signaling = Some(webrtc::SignalingChannel {
+                        incoming_tx,
+                        outgoing_rx,
+                    });
                 }
                 _ => {} // IP and Relay already handled above
             }
@@ -518,19 +521,19 @@ impl Transports {
             let data = &bufs[read_idx][..metas[read_idx].len];
             if webrtc::signaling::is_signaling(data) {
                 // This is a signaling datagram — extract and forward to WebRTC
-                if let Some(msg) = webrtc::signaling::decode(data) {
-                    if let Addr::Relay(_, peer_id) = &self.source_addrs[read_idx] {
-                        trace!(
-                            peer = %peer_id.fmt_short(),
-                            "intercepted WebRTC signaling from relay"
-                        );
-                        let envelope = webrtc::signaling::SignalingEnvelope {
-                            peer: *peer_id,
-                            msg,
-                        };
-                        if let Err(e) = signaling.incoming_tx.try_send(envelope) {
-                            warn!("failed to forward WebRTC signaling: {e}");
-                        }
+                if let Some(msg) = webrtc::signaling::decode(data)
+                    && let Addr::Relay(_, peer_id) = &self.source_addrs[read_idx]
+                {
+                    trace!(
+                        peer = %peer_id.fmt_short(),
+                        "intercepted WebRTC signaling from relay"
+                    );
+                    let envelope = webrtc::signaling::SignalingEnvelope {
+                        peer: *peer_id,
+                        msg,
+                    };
+                    if let Err(e) = signaling.incoming_tx.try_send(envelope) {
+                        warn!("failed to forward WebRTC signaling: {e}");
                     }
                 }
                 // Skip this datagram (don't copy to write position)
@@ -1079,19 +1082,10 @@ impl TransportsSender {
                 }
             }
             Addr::Custom(addr) => {
-                info!(
-                    ?addr,
-                    num_custom_senders = self.custom.len(),
-                    "TransportsSender routing to Custom sender"
-                );
-                for (i, sender) in self.custom.iter().enumerate() {
-                    let valid = sender.is_valid_send_addr(addr);
-                    info!(sender_index = i, valid, "checking custom sender");
-                    if valid {
+                for sender in self.custom.iter() {
+                    if sender.is_valid_send_addr(addr) {
                         match sender.poll_send(cx, addr, transmit) {
-                            Poll::Pending => {
-                                info!(sender_index = i, "custom sender returned Pending");
-                            }
+                            Poll::Pending => {}
                             Poll::Ready(res) => return Poll::Ready(res),
                         }
                     }
@@ -1239,14 +1233,6 @@ impl noq::UdpSender for Sender {
         // Noq eventually considers the packets that had send errors as lost and will try
         // and re-send them.
         let mapped_addr = self.mapped_addr(noq_transmit)?;
-        // Log all sends at info level to diagnose routing
-        if matches!(&mapped_addr, MultipathMappedAddr::Custom(_)) {
-            info!(
-                dst = ?noq_transmit.destination,
-                ?mapped_addr,
-                "Sender::poll_send identified Custom mapped addr"
-            );
-        }
 
         let transport_addr = match mapped_addr {
             MultipathMappedAddr::Mixed(mapped_addr) => {
@@ -1305,12 +1291,6 @@ impl noq::UdpSender for Sender {
                 }
             }
             MultipathMappedAddr::Custom(custom_mapped_addr) => {
-                info!(
-                    ?custom_mapped_addr,
-                    dst = ?noq_transmit.destination,
-                    len = noq_transmit.contents.len(),
-                    "Sender::poll_send routing to Custom transport"
-                );
                 match self
                     .sock
                     .mapped_addrs
