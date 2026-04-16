@@ -549,6 +549,21 @@ impl RemoteStateActor {
         let addrs = to_transports_addr(self.endpoint_id, addrs);
         self.paths.insert_multiple(addrs, Source::App);
         self.paths.resolve_remote(tx);
+
+        // Open custom transport paths on existing connections immediately.
+        // Custom transports (e.g. WebRTC) manage their own connectivity and
+        // should be opened as soon as addresses are known, not only when new
+        // connections are created.
+        let custom_paths = self
+            .paths
+            .addrs()
+            .filter(|a| a.is_custom())
+            .cloned()
+            .collect::<Vec<_>>();
+        for remote in custom_paths {
+            self.open_path(&remote);
+        }
+
         // Start Address Lookup if we have no selected path.
         self.trigger_address_lookup();
     }
@@ -865,7 +880,10 @@ impl RemoteStateActor {
                 Self::configure_path(&path, open_addr);
                 continue;
             }
-            if conn.side().is_server() {
+            // Only the QUIC client can initiate path migration for IP paths
+            // (RFC 9000 §9). Custom transports (e.g. WebRTC) handle their own
+            // connectivity and are exempt from this restriction.
+            if conn.side().is_server() && !open_addr.is_custom() {
                 continue;
             }
             let fut = conn.open_path_ensure(quic_addr, path_status);
