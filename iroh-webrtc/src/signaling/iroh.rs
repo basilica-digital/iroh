@@ -148,15 +148,19 @@ impl Inner {
             None => self.dial_and_register(env.peer).await?,
         };
 
-        // If send fails (channel closed), drop the peer state and try one
-        // redial. This handles races with peer-state eviction.
-        if let Err(mpsc::error::TrySendError::Closed(msg)) = sender.try_send(env.msg.clone()) {
-            debug!(peer = %env.peer.fmt_short(), "signaling writer channel closed; redialing");
-            self.peers.lock().await.remove(&env.peer);
-            let fresh = self.dial_and_register(env.peer).await?;
-            let _ = fresh.send(msg).await;
-        } else if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(env.msg) {
-            warn!(peer = %env.peer.fmt_short(), "signaling outbound queue full; dropping");
+        // Single try_send. On Closed (peer state evicted), drop it and redial
+        // once. On Full, drop the frame with a warning.
+        match sender.try_send(env.msg) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(msg)) => {
+                debug!(peer = %env.peer.fmt_short(), "signaling writer channel closed; redialing");
+                self.peers.lock().await.remove(&env.peer);
+                let fresh = self.dial_and_register(env.peer).await?;
+                let _ = fresh.send(msg).await;
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(peer = %env.peer.fmt_short(), "signaling outbound queue full; dropping");
+            }
         }
 
         Ok(())
