@@ -397,7 +397,7 @@ impl PeerConnectionManager {
                         .channel(channel_id)
                         .ok_or_else(|| io::Error::other("DataChannel not found"))?;
                     channel
-                        .write(false, data)
+                        .write(true, data)
                         .map_err(|e| io::Error::other(format!("DataChannel write failed: {e}")))?;
                     Ok(())
                 } else {
@@ -564,7 +564,7 @@ impl PeerConnectionManager {
                     for data in pending {
                         if let Some(ch_id) = peer.channel_id {
                             if let Some(mut channel) = peer.rtc.channel(ch_id) {
-                                if let Err(e) = channel.write(false, &data) {
+                                if let Err(e) = channel.write(true, &data) {
                                     warn!(
                                         peer = %peer_id.fmt_short(),
                                         "failed to flush pending send: {e}"
