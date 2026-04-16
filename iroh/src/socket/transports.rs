@@ -52,6 +52,11 @@ pub(crate) struct Transports {
     /// Signaling channel for routing WebRTC signaling datagrams from relay to WebRTC transport.
     #[cfg(feature = "unstable-webrtc-transport")]
     webrtc_signaling: Option<webrtc::SignalingChannel>,
+    /// Cache mapping peers to their known relay URL, learned from incoming signaling.
+    /// Used by [`forward_outgoing_signaling`] to route signaling to the correct relay
+    /// for cross-relay WebRTC connections.
+    #[cfg(feature = "unstable-webrtc-transport")]
+    peer_relay_urls: FxHashMap<EndpointId, RelayUrl>,
 }
 
 /// Combined watcher type for all ip transports
@@ -271,6 +276,8 @@ impl Transports {
             source_addrs: Default::default(),
             #[cfg(feature = "unstable-webrtc-transport")]
             webrtc_signaling,
+            #[cfg(feature = "unstable-webrtc-transport")]
+            peer_relay_urls: FxHashMap::default(),
         })
     }
 
@@ -522,12 +529,16 @@ impl Transports {
             if webrtc::signaling::is_signaling(data) {
                 // This is a signaling datagram — extract and forward to WebRTC
                 if let Some(msg) = webrtc::signaling::decode(data)
-                    && let Addr::Relay(_, peer_id) = &self.source_addrs[read_idx]
+                    && let Addr::Relay(relay_url, peer_id) = &self.source_addrs[read_idx]
                 {
                     trace!(
                         peer = %peer_id.fmt_short(),
                         "intercepted WebRTC signaling from relay"
                     );
+                    // Cache the relay URL so we can route outgoing signaling
+                    // to the peer's relay for cross-relay WebRTC connections.
+                    self.peer_relay_urls.insert(*peer_id, relay_url.clone());
+
                     let envelope = webrtc::signaling::SignalingEnvelope {
                         peer: *peer_id,
                         msg,
@@ -559,6 +570,10 @@ impl Transports {
     ///
     /// Drains the outgoing signaling channel and sends each message as a tagged
     /// relay datagram to the destination peer.
+    ///
+    /// Uses the peer's known relay URL (cached from incoming signaling) when
+    /// available, falling back to the local relay. This enables cross-relay
+    /// WebRTC signaling.
     #[cfg(feature = "unstable-webrtc-transport")]
     fn forward_outgoing_signaling(&mut self, cx: &mut Context) {
         let Some(signaling) = &mut self.webrtc_signaling else {
@@ -578,23 +593,31 @@ impl Transports {
             );
             let payload = webrtc::signaling::encode(&envelope.msg);
 
-            // Send through the first available relay transport
+            // Use the peer's known relay URL if available (learned from incoming
+            // signaling), otherwise fall back to our local relay.
+            let peer_relay = self.peer_relay_urls.get(&envelope.peer).cloned();
+
             let mut sent = false;
             for relay_transport in &self.relay {
-                let home_relay = relay_transport.local_addr_watch().get();
-                if let Some((relay_url, _)) = home_relay {
-                    let send_item = relay::RelaySendItemExport {
-                        remote_endpoint: envelope.peer,
-                        url: relay_url,
-                        datagrams: iroh_relay::protos::relay::Datagrams::from(payload.clone()),
-                    };
-                    if let Err(e) = relay_transport.send_signaling(send_item) {
-                        warn!("failed to send WebRTC signaling via relay: {e}");
-                    } else {
-                        sent = true;
-                    }
-                    break;
+                let dest_url = if let Some(ref url) = peer_relay {
+                    url.clone()
+                } else if let Some((url, _)) = relay_transport.local_addr_watch().get() {
+                    url
+                } else {
+                    continue;
+                };
+
+                let send_item = relay::RelaySendItemExport {
+                    remote_endpoint: envelope.peer,
+                    url: dest_url,
+                    datagrams: iroh_relay::protos::relay::Datagrams::from(payload.clone()),
+                };
+                if let Err(e) = relay_transport.send_signaling(send_item) {
+                    warn!("failed to send WebRTC signaling via relay: {e}");
+                } else {
+                    sent = true;
                 }
+                break;
             }
             if !sent {
                 warn!(
