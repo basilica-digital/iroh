@@ -24,10 +24,7 @@ use str0m::{
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
-use crate::socket::transports::webrtc::{
-    WebRtcConfig,
-    signaling::{SignalingEnvelope, SignalingMsg},
-};
+use crate::socket::transports::webrtc::signaling::{SignalingEnvelope, SignalingMsg};
 
 /// Label for the unreliable datagram DataChannel.
 const DATA_CHANNEL_LABEL: &str = "iroh-quic";
@@ -36,7 +33,6 @@ const DATA_CHANNEL_LABEL: &str = "iroh-quic";
 #[derive(Debug)]
 pub(crate) struct PeerConnectionManager {
     my_id: EndpointId,
-    config: WebRtcConfig,
     /// Active peer connections keyed by remote EndpointId.
     peers: HashMap<EndpointId, PeerState>,
     /// Channel to send signaling messages outward (to relay).
@@ -99,13 +95,11 @@ impl PeerConnectionManager {
     /// Creates a new peer connection manager.
     pub(crate) fn new(
         my_id: EndpointId,
-        config: WebRtcConfig,
         signaling_tx: mpsc::Sender<SignalingEnvelope>,
         datagram_tx: mpsc::Sender<(EndpointId, Bytes)>,
     ) -> Self {
         Self {
             my_id,
-            config,
             peers: HashMap::new(),
             signaling_tx,
             datagram_tx,
@@ -113,16 +107,12 @@ impl PeerConnectionManager {
         }
     }
 
-    /// Creates a new str0m `Rtc` instance with our ICE configuration.
-    fn create_rtc(&self) -> Rtc {
-        let rtc = Rtc::builder()
+    /// Creates a new str0m `Rtc` instance.
+    fn create_rtc() -> Rtc {
+        Rtc::builder()
             // Only DataChannels, no media
             .set_ice_lite(false)
-            .build(Instant::now());
-
-        // Add STUN servers as remote candidates will be discovered via ICE
-        // str0m handles STUN binding requests internally
-        rtc
+            .build(Instant::now())
     }
 
     /// Binds a new UDP socket for a peer connection.
@@ -133,8 +123,8 @@ impl PeerConnectionManager {
     ///
     /// Falls back to `127.0.0.1` if no default route is available.
     fn bind_socket() -> io::Result<tokio::net::UdpSocket> {
-        let bind_ip = Self::default_local_ip()
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let bind_ip =
+            Self::default_local_ip().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let std_socket = std::net::UdpSocket::bind(std::net::SocketAddr::new(bind_ip, 0))?;
         std_socket.set_nonblocking(true)?;
         tokio::net::UdpSocket::from_std(std_socket)
@@ -167,7 +157,7 @@ impl PeerConnectionManager {
         let socket = Self::bind_socket()?;
         let local_addr = socket.local_addr()?;
 
-        let mut rtc = self.create_rtc();
+        let mut rtc = Self::create_rtc();
 
         // Add our local socket as an ICE host candidate
         if let Ok(candidate) = Candidate::host(local_addr, "udp") {
@@ -225,30 +215,30 @@ impl PeerConnectionManager {
     ) -> io::Result<()> {
         // Glare resolution: if we already have a pending connection to this peer,
         // the peer with the smaller EndpointId yields (is "polite").
-        if let Some(existing) = self.peers.get(&peer_id) {
-            if existing.state == ConnectionState::Connecting {
-                if self.my_id < peer_id {
-                    // We are polite: roll back our offer, accept theirs
-                    debug!(
-                        peer = %peer_id.fmt_short(),
-                        "glare detected, yielding as polite peer"
-                    );
-                    self.peers.remove(&peer_id);
-                } else {
-                    // We are impolite: ignore their offer
-                    debug!(
-                        peer = %peer_id.fmt_short(),
-                        "glare detected, ignoring offer as impolite peer"
-                    );
-                    return Ok(());
-                }
+        if let Some(existing) = self.peers.get(&peer_id)
+            && existing.state == ConnectionState::Connecting
+        {
+            if self.my_id < peer_id {
+                // We are polite: roll back our offer, accept theirs
+                debug!(
+                    peer = %peer_id.fmt_short(),
+                    "glare detected, yielding as polite peer"
+                );
+                self.peers.remove(&peer_id);
+            } else {
+                // We are impolite: ignore their offer
+                debug!(
+                    peer = %peer_id.fmt_short(),
+                    "glare detected, ignoring offer as impolite peer"
+                );
+                return Ok(());
             }
         }
 
         let socket = Self::bind_socket()?;
         let local_addr = socket.local_addr()?;
 
-        let mut rtc = self.create_rtc();
+        let mut rtc = Self::create_rtc();
 
         // Add our local socket as an ICE host candidate
         if let Ok(candidate) = Candidate::host(local_addr, "udp") {
@@ -366,15 +356,15 @@ impl PeerConnectionManager {
 
     /// Handles a close request for a session.
     pub(crate) fn handle_close(&mut self, peer_id: EndpointId, session_id: u64) {
-        if let Some(peer) = self.peers.get(&peer_id) {
-            if peer.session_id == session_id {
-                debug!(
-                    peer = %peer_id.fmt_short(),
-                    session_id,
-                    "closing WebRTC connection"
-                );
-                self.peers.remove(&peer_id);
-            }
+        if let Some(peer) = self.peers.get(&peer_id)
+            && peer.session_id == session_id
+        {
+            debug!(
+                peer = %peer_id.fmt_short(),
+                session_id,
+                "closing WebRTC connection"
+            );
+            self.peers.remove(&peer_id);
         }
     }
 
@@ -447,11 +437,10 @@ impl PeerConnectionManager {
                 match peer.socket.poll_recv_from(cx, &mut read_buf) {
                     Poll::Ready(Ok(source)) => {
                         let n = read_buf.filled().len();
-                        drop(read_buf);
                         let local_addr = peer
                             .socket
                             .local_addr()
-                            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+                            .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
                         let receive = match Receive::new(
                             str0m::net::Protocol::Udp,
                             source,
@@ -572,15 +561,14 @@ impl PeerConnectionManager {
                     // Flush pending sends
                     let pending: Vec<_> = peer.pending_sends.drain(..).collect();
                     for data in pending {
-                        if let Some(ch_id) = peer.channel_id {
-                            if let Some(mut channel) = peer.rtc.channel(ch_id) {
-                                if let Err(e) = channel.write(true, &data) {
-                                    warn!(
-                                        peer = %peer_id.fmt_short(),
-                                        "failed to flush pending send: {e}"
-                                    );
-                                }
-                            }
+                        if let Some(ch_id) = peer.channel_id
+                            && let Some(mut channel) = peer.rtc.channel(ch_id)
+                            && let Err(e) = channel.write(true, &data)
+                        {
+                            warn!(
+                                peer = %peer_id.fmt_short(),
+                                "failed to flush pending send: {e}"
+                            );
                         }
                     }
                     Self::flush_peer_outputs(peer, &peer_id);
@@ -598,11 +586,11 @@ impl PeerConnectionManager {
                     peer = %peer_id.fmt_short(),
                     "DataChannel closed"
                 );
-                if let Some(peer) = self.peers.get_mut(&peer_id) {
-                    if peer.channel_id == Some(channel_id) {
-                        peer.channel_id = None;
-                        peer.state = ConnectionState::Closed;
-                    }
+                if let Some(peer) = self.peers.get_mut(&peer_id)
+                    && peer.channel_id == Some(channel_id)
+                {
+                    peer.channel_id = None;
+                    peer.state = ConnectionState::Closed;
                 }
             }
             _ => {
@@ -641,8 +629,9 @@ impl PeerConnectionManager {
                         len = transmit.contents.len(),
                         "flush transmit"
                     );
-                    if let Err(e) =
-                        peer.socket.try_send_to(&transmit.contents, transmit.destination)
+                    if let Err(e) = peer
+                        .socket
+                        .try_send_to(&transmit.contents, transmit.destination)
                     {
                         warn!(
                             peer = %peer_id.fmt_short(),
@@ -658,28 +647,23 @@ impl PeerConnectionManager {
                     // Fast-forward to the next str0m timeout to flush any
                     // data that was buffered but not yet packaged.
                     let _ = peer.rtc.handle_input(Input::Timeout(t));
-                    loop {
-                        match peer.rtc.poll_output() {
-                            Ok(Output::Transmit(transmit)) => {
-                                produced_transmit = true;
-                                trace!(
-                                    peer = %peer_id.fmt_short(),
-                                    dst = %transmit.destination,
-                                    len = transmit.contents.len(),
-                                    "flush transmit (post-timeout)"
-                                );
-                                if let Err(e) = peer
-                                    .socket
-                                    .try_send_to(&transmit.contents, transmit.destination)
-                                {
-                                    warn!(
-                                        peer = %peer_id.fmt_short(),
-                                        dst = %transmit.destination,
-                                        "UDP send error during flush: {e}"
-                                    );
-                                }
-                            }
-                            _ => break,
+                    while let Ok(Output::Transmit(transmit)) = peer.rtc.poll_output() {
+                        produced_transmit = true;
+                        trace!(
+                            peer = %peer_id.fmt_short(),
+                            dst = %transmit.destination,
+                            len = transmit.contents.len(),
+                            "flush transmit (post-timeout)"
+                        );
+                        if let Err(e) = peer
+                            .socket
+                            .try_send_to(&transmit.contents, transmit.destination)
+                        {
+                            warn!(
+                                peer = %peer_id.fmt_short(),
+                                dst = %transmit.destination,
+                                "UDP send error during flush: {e}"
+                            );
                         }
                     }
                     break;
@@ -709,7 +693,6 @@ mod tests {
     use iroh_base::SecretKey;
 
     use super::*;
-    use crate::socket::transports::webrtc::WebRtcConfig;
 
     /// Relays all pending signaling messages between two managers.
     ///
@@ -774,15 +757,13 @@ mod tests {
         let id_a = key_a.public();
         let id_b = key_b.public();
 
-        let config = WebRtcConfig::default();
-
         let (a_sig_tx, mut a_sig_rx) = mpsc::channel(64);
         let (b_sig_tx, mut b_sig_rx) = mpsc::channel(64);
         let (_a_dgram_tx, mut _a_dgram_rx) = mpsc::channel::<(EndpointId, Bytes)>(64);
         let (b_dgram_tx, mut b_dgram_rx) = mpsc::channel(64);
 
-        let mut mgr_a = PeerConnectionManager::new(id_a, config.clone(), a_sig_tx, _a_dgram_tx);
-        let mut mgr_b = PeerConnectionManager::new(id_b, config, b_sig_tx, b_dgram_tx);
+        let mut mgr_a = PeerConnectionManager::new(id_a, a_sig_tx, _a_dgram_tx);
+        let mut mgr_b = PeerConnectionManager::new(id_b, b_sig_tx, b_dgram_tx);
 
         // A sends to B — triggers connection initiation, queues data
         let waker = std::task::Waker::noop();
@@ -842,13 +823,12 @@ mod tests {
             (id_b, id_a)
         };
 
-        let config = WebRtcConfig::default();
         let (sig_tx, _) = mpsc::channel(64);
         let (dgram_tx, _) = mpsc::channel(64);
 
         let mut polite_mgr =
-            PeerConnectionManager::new(polite_id, config.clone(), sig_tx.clone(), dgram_tx.clone());
-        let mut impolite_mgr = PeerConnectionManager::new(impolite_id, config, sig_tx, dgram_tx);
+            PeerConnectionManager::new(polite_id, sig_tx.clone(), dgram_tx.clone());
+        let mut impolite_mgr = PeerConnectionManager::new(impolite_id, sig_tx, dgram_tx);
 
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(&waker);
@@ -892,7 +872,7 @@ mod tests {
 
         let (sig_tx, mut sig_rx) = mpsc::channel(64);
         let (dgram_tx, _) = mpsc::channel(64);
-        let mut mgr = PeerConnectionManager::new(id_a, WebRtcConfig::default(), sig_tx, dgram_tx);
+        let mut mgr = PeerConnectionManager::new(id_a, sig_tx, dgram_tx);
 
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(&waker);
@@ -936,17 +916,26 @@ mod tests {
         // Typical browser host candidate
         let host = "candidate:842163049 1 udp 2122260223 192.168.1.100 54321 typ host generation 0 ufrag 1234 network-id 1 network-cost 10";
         let result = Candidate::from_sdp_string(host);
-        assert!(result.is_ok(), "Failed to parse browser host candidate: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Failed to parse browser host candidate: {result:?}"
+        );
 
         // Browser SRFLX candidate (via STUN)
         let srflx = "candidate:842163049 1 udp 1677729535 203.0.113.5 54321 typ srflx raddr 192.168.1.100 rport 12345 generation 0 ufrag 1234 network-id 1";
         let result = Candidate::from_sdp_string(srflx);
-        assert!(result.is_ok(), "Failed to parse browser srflx candidate: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Failed to parse browser srflx candidate: {result:?}"
+        );
 
         // Minimal candidate (no extensions)
         let minimal = "candidate:1 1 udp 2130706175 10.0.0.1 5000 typ host";
         let result = Candidate::from_sdp_string(minimal);
-        assert!(result.is_ok(), "Failed to parse minimal candidate: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Failed to parse minimal candidate: {result:?}"
+        );
     }
 
     /// Verifies that str0m includes the host candidate in the SDP offer,
@@ -958,7 +947,7 @@ mod tests {
 
         let (sig_tx, mut sig_rx) = mpsc::channel(64);
         let (dgram_tx, _) = mpsc::channel(64);
-        let mut mgr = PeerConnectionManager::new(id, WebRtcConfig::default(), sig_tx, dgram_tx);
+        let mut mgr = PeerConnectionManager::new(id, sig_tx, dgram_tx);
 
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(&waker);
