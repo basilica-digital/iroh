@@ -4,7 +4,7 @@
 //! All JavaScript callbacks push events to Rust channels for poll-based integration.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     io,
     rc::Rc,
@@ -76,6 +76,14 @@ struct PeerState {
     pending_sends: Vec<Bytes>,
     /// Channel receiving events from JS callbacks (ICE state changes, DataChannel open/close).
     event_rx: mpsc::Receiver<PeerEvent>,
+    /// Whether `setRemoteDescription` has completed on this peer connection.
+    /// Shared with the async block that applies the remote description.
+    remote_desc_set: Rc<Cell<bool>>,
+    /// ICE candidates buffered while waiting for `setRemoteDescription` to complete.
+    /// `addIceCandidate()` fails if called before the remote description is set,
+    /// so we queue candidates here and flush them once the description is applied.
+    /// Shared with the async block that applies the remote description.
+    pending_remote_candidates: Rc<RefCell<Vec<(String, Option<String>)>>>,
     /// Closures we need to keep alive for the JS callbacks.
     _closures: Vec<Closure<dyn FnMut(JsValue)>>,
 }
@@ -404,6 +412,8 @@ impl PeerConnectionManager {
                 send_waker: None,
                 pending_sends: Vec::new(),
                 event_rx,
+                remote_desc_set: Rc::new(Cell::new(false)),
+                pending_remote_candidates: Rc::new(RefCell::new(Vec::new())),
                 _closures: closures,
             },
         );
@@ -440,10 +450,17 @@ impl PeerConnectionManager {
         let (pc, _event_tx, event_rx, remote_channel, closures) =
             self.create_peer_connection(peer_id, session_id)?;
 
-        // Set remote description (offer) and create answer
+        // Set remote description (offer) and create answer.
+        // ICE candidates arriving before setRemoteDescription completes are
+        // buffered in pending_remote_candidates and flushed here.
         let sdp_owned = sdp.to_string();
         let signaling_tx = self.signaling_tx.clone();
         let pc_clone = pc.clone();
+        let remote_desc_set = Rc::new(Cell::new(false));
+        let pending_remote_candidates: Rc<RefCell<Vec<(String, Option<String>)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let rds = remote_desc_set.clone();
+        let prc = pending_remote_candidates.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut offer_desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
             offer_desc.set_sdp(&sdp_owned);
@@ -453,6 +470,22 @@ impl PeerConnectionManager {
             {
                 warn!(?e, "set_remote_description failed for offer");
                 return;
+            }
+
+            // Remote description is now set — flush any buffered ICE candidates.
+            rds.set(true);
+            for (candidate, sdp_mid) in prc.borrow_mut().drain(..) {
+                let mut init = RtcIceCandidateInit::new(&candidate);
+                if let Some(mid) = &sdp_mid {
+                    init.set_sdp_mid(Some(mid));
+                }
+                if let Err(e) = wasm_bindgen_futures::JsFuture::from(
+                    pc_clone.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&init)),
+                )
+                .await
+                {
+                    warn!(%candidate, ?e, "addIceCandidate failed for buffered candidate");
+                }
             }
 
             let answer = match wasm_bindgen_futures::JsFuture::from(pc_clone.create_answer()).await
@@ -506,6 +539,8 @@ impl PeerConnectionManager {
                 send_waker: None,
                 pending_sends: Vec::new(),
                 event_rx,
+                remote_desc_set,
+                pending_remote_candidates,
                 _closures: closures,
             },
         );
@@ -531,6 +566,8 @@ impl PeerConnectionManager {
 
         let pc_clone = peer.pc.clone();
         let sdp_owned = sdp.to_string();
+        let rds = peer.remote_desc_set.clone();
+        let prc = peer.pending_remote_candidates.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
             desc.set_sdp(&sdp_owned);
@@ -538,6 +575,23 @@ impl PeerConnectionManager {
                 wasm_bindgen_futures::JsFuture::from(pc_clone.set_remote_description(&desc)).await
             {
                 warn!(?e, "set_remote_description failed for answer");
+                return;
+            }
+
+            // Remote description is now set — flush any buffered ICE candidates.
+            rds.set(true);
+            for (candidate, sdp_mid) in prc.borrow_mut().drain(..) {
+                let mut init = RtcIceCandidateInit::new(&candidate);
+                if let Some(mid) = &sdp_mid {
+                    init.set_sdp_mid(Some(mid));
+                }
+                if let Err(e) = wasm_bindgen_futures::JsFuture::from(
+                    pc_clone.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&init)),
+                )
+                .await
+                {
+                    warn!(%candidate, ?e, "addIceCandidate failed for buffered candidate");
+                }
             }
         });
 
@@ -545,6 +599,11 @@ impl PeerConnectionManager {
     }
 
     /// Handles an incoming ICE candidate from a remote peer.
+    ///
+    /// If `setRemoteDescription` hasn't completed yet, the candidate is buffered
+    /// and will be added once the remote description is applied. Calling
+    /// `addIceCandidate` before the remote description is set would fail with
+    /// `InvalidStateError`.
     pub(crate) fn handle_ice_candidate(
         &mut self,
         peer_id: EndpointId,
@@ -561,17 +620,39 @@ impl PeerConnectionManager {
             return Err(io::Error::other("session_id mismatch"));
         }
 
-        let mut init = RtcIceCandidateInit::new(&candidate);
+        // Buffer the candidate if remote description hasn't been applied yet.
+        // The setRemoteDescription async block will flush these.
+        if !peer.remote_desc_set.get() {
+            debug!(
+                peer = %peer_id.fmt_short(),
+                %candidate,
+                "buffering ICE candidate (remote description not yet set)"
+            );
+            peer.pending_remote_candidates
+                .borrow_mut()
+                .push((candidate.to_string(), sdp_mid.map(|s| s.to_string())));
+            return Ok(());
+        }
+
+        let candidate_owned = candidate.to_string();
+        let mut init = RtcIceCandidateInit::new(candidate);
         if let Some(mid) = sdp_mid {
             init.set_sdp_mid(Some(mid));
         }
 
         let pc_clone = peer.pc.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = wasm_bindgen_futures::JsFuture::from(
+            if let Err(e) = wasm_bindgen_futures::JsFuture::from(
                 pc_clone.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&init)),
             )
-            .await;
+            .await
+            {
+                warn!(
+                    candidate = %candidate_owned,
+                    ?e,
+                    "addIceCandidate failed"
+                );
+            }
         });
 
         Ok(())
