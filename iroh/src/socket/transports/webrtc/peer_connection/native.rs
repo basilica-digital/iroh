@@ -399,6 +399,7 @@ impl PeerConnectionManager {
                     channel
                         .write(true, data)
                         .map_err(|e| io::Error::other(format!("DataChannel write failed: {e}")))?;
+                    Self::flush_peer_outputs(peer, &peer_id);
                     Ok(())
                 } else {
                     Err(io::Error::other("connected but no DataChannel"))
@@ -573,6 +574,7 @@ impl PeerConnectionManager {
                             }
                         }
                     }
+                    Self::flush_peer_outputs(peer, &peer_id);
 
                     if let Some(waker) = peer.send_waker.take() {
                         waker.wake();
@@ -608,6 +610,47 @@ impl PeerConnectionManager {
                 peer = %peer_id.fmt_short(),
                 "failed to deliver WebRTC datagram: {e}"
             );
+        }
+    }
+
+    /// Flushes pending str0m transmit outputs for a peer.
+    ///
+    /// After writing data to a DataChannel via `channel.write()`, str0m buffers
+    /// the SCTP/DTLS frames internally. They are only emitted as UDP packets
+    /// through `poll_output()`. Normally `poll()` drives this, but `poll()` only
+    /// runs inside `poll_recv()` which may not be called promptly (the str0m UDP
+    /// socket is not registered with the async runtime). Calling this immediately
+    /// after a write ensures the data is transmitted without waiting for the next
+    /// poll cycle.
+    fn flush_peer_outputs(peer: &mut PeerState, peer_id: &EndpointId) {
+        let now = Instant::now();
+        // Drive str0m's state machine so it processes the buffered write.
+        if let Err(e) = peer.rtc.handle_input(Input::Timeout(now)) {
+            trace!(
+                peer = %peer_id.fmt_short(),
+                "str0m timeout during flush: {e}"
+            );
+        }
+        loop {
+            match peer.rtc.poll_output() {
+                Ok(Output::Transmit(transmit)) => {
+                    if let Err(e) =
+                        peer.socket.send_to(&transmit.contents, transmit.destination)
+                    {
+                        warn!(
+                            peer = %peer_id.fmt_short(),
+                            dst = %transmit.destination,
+                            "UDP send error during flush: {e}"
+                        );
+                    }
+                }
+                Ok(Output::Event(_)) => {
+                    // Events (e.g. channel state changes) will be handled
+                    // in the next poll() call.
+                }
+                Ok(Output::Timeout(_)) => break,
+                Err(_) => break,
+            }
         }
     }
 }
