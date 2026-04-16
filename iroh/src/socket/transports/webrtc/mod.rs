@@ -21,6 +21,15 @@
 mod peer_connection;
 pub(crate) mod signaling;
 
+/// Returns the current in-browser WebRTC diagnostic log (browser only).
+///
+/// Exposed so example apps and users debugging mobile browsers can surface the
+/// log via a copy button on the page. Entries are prefixed with a
+/// `Date.now()` millisecond timestamp and cover SDP offer/answer exchange,
+/// local/remote ICE candidates, state changes, and errors.
+#[cfg(wasm_browser)]
+pub use peer_connection::{webrtc_debug_clear, webrtc_debug_snapshot};
+
 use std::{
     io,
     sync::{Arc, Mutex},

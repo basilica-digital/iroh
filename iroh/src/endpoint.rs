@@ -36,6 +36,13 @@ pub mod transports {
     #[cfg(feature = "unstable-webrtc-transport")]
     pub mod webrtc {
         pub use crate::socket::transports::webrtc::{IceServer, WebRtcConfig, WebRtcTransport};
+
+        /// Diagnostic snapshot of WebRTC signaling/ICE events (browser only).
+        ///
+        /// Returns the current debug log as a newline-joined string, suitable for
+        /// being rendered in a textarea and copy-pasted for debugging.
+        #[cfg(wasm_browser)]
+        pub use crate::socket::transports::webrtc::{webrtc_debug_clear, webrtc_debug_snapshot};
     }
 }
 

@@ -31,6 +31,79 @@ use crate::socket::transports::webrtc::{
 /// Label for the unreliable datagram DataChannel.
 const DATA_CHANNEL_LABEL: &str = "iroh-quic";
 
+// -----------------------------------------------------------------------------
+// Diagnostic event log
+//
+// The browser's devtools console is not easily accessible on mobile (iOS in
+// particular), so we keep an in-memory ring buffer of WebRTC signaling and ICE
+// events that can be retrieved as a single `String` via
+// [`webrtc_debug_snapshot`] and copy-pasted out of the page. Entries are
+// prefixed with a millisecond timestamp so relative timing between events
+// (e.g. how long ICE stayed in `checking`) is visible.
+// -----------------------------------------------------------------------------
+
+/// Maximum number of diagnostic entries to keep in memory.
+const DEBUG_LOG_MAX_ENTRIES: usize = 1024;
+
+thread_local! {
+    static DEBUG_LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Records a diagnostic event into the in-memory log.
+fn debug_record(msg: impl Into<String>) {
+    let ts = js_sys::Date::now();
+    let entry = format!("[{ts:.0}] {}", msg.into());
+    DEBUG_LOG.with(|log| {
+        let mut log = log.borrow_mut();
+        if log.len() >= DEBUG_LOG_MAX_ENTRIES {
+            log.remove(0);
+        }
+        log.push(entry);
+    });
+}
+
+/// Returns the current WebRTC diagnostic log as a newline-joined string.
+///
+/// Use this from the browser example or other wasm code to expose the log to
+/// JavaScript for copy-paste debugging. Entries are timestamped with
+/// `Date.now()` milliseconds.
+pub fn webrtc_debug_snapshot() -> String {
+    DEBUG_LOG.with(|log| log.borrow().join("\n"))
+}
+
+/// Clears the in-memory WebRTC diagnostic log.
+pub fn webrtc_debug_clear() {
+    DEBUG_LOG.with(|log| log.borrow_mut().clear());
+}
+
+/// Counts `a=candidate:...typ <kind>` lines in a raw SDP blob, returning
+/// a short human-readable summary like `host=1 srflx=1 relay=0 prflx=0 total=2`.
+///
+/// This is purely observational — we do not parse or modify the SDP.
+fn summarize_sdp_candidates(sdp: &str) -> String {
+    let mut host = 0;
+    let mut srflx = 0;
+    let mut relay = 0;
+    let mut prflx = 0;
+    let mut total = 0;
+    for line in sdp.lines() {
+        let Some(rest) = line.strip_prefix("a=candidate:") else {
+            continue;
+        };
+        total += 1;
+        if rest.contains(" typ host") {
+            host += 1;
+        } else if rest.contains(" typ srflx") {
+            srflx += 1;
+        } else if rest.contains(" typ relay") {
+            relay += 1;
+        } else if rest.contains(" typ prflx") {
+            prflx += 1;
+        }
+    }
+    format!("host={host} srflx={srflx} relay={relay} prflx={prflx} total={total}")
+}
+
 /// Manages WebRTC peer connections in the browser using `web-sys`.
 #[derive(Debug)]
 pub(crate) struct PeerConnectionManager {
@@ -199,22 +272,33 @@ impl PeerConnectionManager {
         let signaling_tx = self.signaling_tx.clone();
         let pid = peer_id;
         let sid = session_id;
+        let peer_short_ice = peer_id.fmt_short().to_string();
         let on_ice_candidate = Closure::wrap(Box::new(move |event: JsValue| {
             let event: RtcPeerConnectionIceEvent = event.unchecked_into();
             if let Some(candidate) = event.candidate() {
                 let candidate_str = candidate.candidate();
                 if !candidate_str.is_empty() {
+                    debug_record(format!(
+                        "[{peer_short_ice}] local ICE candidate (trickling): {candidate_str}"
+                    ));
                     if let Err(e) = signaling_tx.try_send(SignalingEnvelope {
                         peer: pid,
                         msg: SignalingMsg::IceCandidate {
                             session_id: sid,
-                            candidate: candidate_str,
+                            candidate: candidate_str.clone(),
                             sdp_mid: candidate.sdp_mid(),
                         },
                     }) {
                         warn!("failed to send local ICE candidate via signaling: {e}");
+                        debug_record(format!(
+                            "[{peer_short_ice}] FAILED to enqueue local ICE candidate: {e}"
+                        ));
                     }
                 }
+            } else {
+                debug_record(format!(
+                    "[{peer_short_ice}] local ICE gathering complete (null candidate)"
+                ));
             }
         }) as Box<dyn FnMut(JsValue)>);
         pc.set_onicecandidate(Some(on_ice_candidate.as_ref().unchecked_ref()));
@@ -223,9 +307,13 @@ impl PeerConnectionManager {
         // oniceconnectionstatechange
         let pc_clone = pc.clone();
         let event_tx_clone = event_tx.clone();
+        let peer_short_state = peer_id.fmt_short().to_string();
         let on_ice_state = Closure::wrap(Box::new(move |_: JsValue| {
             let state = pc_clone.ice_connection_state();
             let state_str = format!("{:?}", state);
+            debug_record(format!(
+                "[{peer_short_state}] ICE connection state -> {state_str}"
+            ));
             let _ = event_tx_clone.try_send(PeerEvent::IceConnectionStateChange(state_str));
         }) as Box<dyn FnMut(JsValue)>);
         pc.set_oniceconnectionstatechange(Some(on_ice_state.as_ref().unchecked_ref()));
@@ -240,10 +328,14 @@ impl PeerConnectionManager {
         let event_tx_clone = event_tx.clone();
         let pid = peer_id;
         let dc_ref = remote_channel.clone();
+        let peer_short_dc = peer_id.fmt_short().to_string();
         let on_datachannel = Closure::wrap(Box::new(move |event: JsValue| {
             let event: RtcDataChannelEvent = event.unchecked_into();
             let channel = event.channel();
             channel.set_binary_type(RtcDataChannelType::Arraybuffer);
+            debug_record(format!(
+                "[{peer_short_dc}] ondatachannel fired (answerer received DataChannel)"
+            ));
 
             // Store channel reference so PeerState can pick it up in poll().
             *dc_ref.borrow_mut() = Some(channel.clone());
@@ -354,14 +446,21 @@ impl PeerConnectionManager {
         let dc_closures = self.setup_data_channel_events(&channel, peer_id, &event_tx);
         closures.extend(dc_closures);
 
+        debug_record(format!(
+            "[{peer}] initiate (browser offerer) session={session_id}",
+            peer = peer_id.fmt_short()
+        ));
+
         // Spawn async task to create offer
         let signaling_tx = self.signaling_tx.clone();
         let pc_clone = pc.clone();
+        let peer_short = peer_id.fmt_short().to_string();
         wasm_bindgen_futures::spawn_local(async move {
             let offer = match wasm_bindgen_futures::JsFuture::from(pc_clone.create_offer()).await {
                 Ok(o) => o,
                 Err(e) => {
                     warn!(?e, "create_offer failed");
+                    debug_record(format!("[{peer_short}] create_offer FAILED: {e:?}"));
                     return;
                 }
             };
@@ -373,9 +472,16 @@ impl PeerConnectionManager {
                 Some(sdp) => sdp,
                 None => {
                     warn!("offer missing sdp string");
+                    debug_record(format!("[{peer_short}] offer missing sdp string"));
                     return;
                 }
             };
+
+            debug_record(format!(
+                "[{peer_short}] created offer: {len} bytes, candidates: {summary}",
+                len = offer_sdp.len(),
+                summary = summarize_sdp_candidates(&offer_sdp)
+            ));
 
             let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
             desc.set_sdp(&offer_sdp);
@@ -383,8 +489,12 @@ impl PeerConnectionManager {
                 wasm_bindgen_futures::JsFuture::from(pc_clone.set_local_description(&desc)).await
             {
                 warn!(?e, "set_local_description failed for offer");
+                debug_record(format!(
+                    "[{peer_short}] setLocalDescription(offer) FAILED: {e:?}"
+                ));
                 return;
             }
+            debug_record(format!("[{peer_short}] setLocalDescription(offer) OK"));
 
             let _ = signaling_tx
                 .send(SignalingEnvelope {
@@ -395,6 +505,7 @@ impl PeerConnectionManager {
                     },
                 })
                 .await;
+            debug_record(format!("[{peer_short}] sent offer via signaling"));
         });
 
         debug!(
@@ -452,6 +563,13 @@ impl PeerConnectionManager {
         let (pc, _event_tx, event_rx, remote_channel, closures) =
             self.create_peer_connection(peer_id, session_id)?;
 
+        debug_record(format!(
+            "[{peer}] received OFFER (browser answerer): {len} bytes, candidates: {summary}",
+            peer = peer_id.fmt_short(),
+            len = sdp.len(),
+            summary = summarize_sdp_candidates(sdp)
+        ));
+
         // Set remote description (offer) and create answer.
         // ICE candidates arriving before setRemoteDescription completes are
         // buffered in pending_remote_candidates and flushed here.
@@ -463,6 +581,7 @@ impl PeerConnectionManager {
             Rc::new(RefCell::new(Vec::new()));
         let rds = remote_desc_set.clone();
         let prc = pending_remote_candidates.clone();
+        let peer_short = peer_id.fmt_short().to_string();
         wasm_bindgen_futures::spawn_local(async move {
             let mut offer_desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
             offer_desc.set_sdp(&sdp_owned);
@@ -471,8 +590,12 @@ impl PeerConnectionManager {
                     .await
             {
                 warn!(?e, "set_remote_description failed for offer");
+                debug_record(format!(
+                    "[{peer_short}] setRemoteDescription(offer) FAILED: {e:?}"
+                ));
                 return;
             }
+            debug_record(format!("[{peer_short}] setRemoteDescription(offer) OK"));
 
             // Remote description is now set — flush any buffered ICE candidates.
             rds.set(true);
@@ -482,6 +605,10 @@ impl PeerConnectionManager {
                     count = buffered.len(),
                     "flushing buffered ICE candidates after setRemoteDescription (answerer)"
                 );
+                debug_record(format!(
+                    "[{peer_short}] flushing {n} buffered remote ICE candidates (answerer)",
+                    n = buffered.len()
+                ));
             }
             for (candidate, sdp_mid) in buffered {
                 let mut init = RtcIceCandidateInit::new(&candidate);
@@ -493,9 +620,17 @@ impl PeerConnectionManager {
                 )
                 .await
                 {
-                    Ok(_) => debug!(%candidate, "addIceCandidate succeeded (buffered, answerer)"),
+                    Ok(_) => {
+                        debug!(%candidate, "addIceCandidate succeeded (buffered, answerer)");
+                        debug_record(format!(
+                            "[{peer_short}] addIceCandidate OK (buffered): {candidate}"
+                        ));
+                    }
                     Err(e) => {
-                        warn!(%candidate, ?e, "addIceCandidate failed for buffered candidate")
+                        warn!(%candidate, ?e, "addIceCandidate failed for buffered candidate");
+                        debug_record(format!(
+                            "[{peer_short}] addIceCandidate FAILED (buffered): {candidate} err={e:?}"
+                        ));
                     }
                 }
             }
@@ -505,6 +640,7 @@ impl PeerConnectionManager {
                 Ok(a) => a,
                 Err(e) => {
                     warn!(?e, "create_answer failed");
+                    debug_record(format!("[{peer_short}] create_answer FAILED: {e:?}"));
                     return;
                 }
             };
@@ -516,9 +652,16 @@ impl PeerConnectionManager {
                 Some(sdp) => sdp,
                 None => {
                     warn!("answer missing sdp string");
+                    debug_record(format!("[{peer_short}] answer missing sdp string"));
                     return;
                 }
             };
+
+            debug_record(format!(
+                "[{peer_short}] created answer: {len} bytes, candidates: {summary}",
+                len = answer_sdp.len(),
+                summary = summarize_sdp_candidates(&answer_sdp)
+            ));
 
             let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
             desc.set_sdp(&answer_sdp);
@@ -526,8 +669,12 @@ impl PeerConnectionManager {
                 wasm_bindgen_futures::JsFuture::from(pc_clone.set_local_description(&desc)).await
             {
                 warn!(?e, "set_local_description failed for answer");
+                debug_record(format!(
+                    "[{peer_short}] setLocalDescription(answer) FAILED: {e:?}"
+                ));
                 return;
             }
+            debug_record(format!("[{peer_short}] setLocalDescription(answer) OK"));
 
             let _ = signaling_tx
                 .send(SignalingEnvelope {
@@ -538,6 +685,7 @@ impl PeerConnectionManager {
                     },
                 })
                 .await;
+            debug_record(format!("[{peer_short}] sent answer via signaling"));
         });
 
         self.peers.insert(
@@ -576,10 +724,18 @@ impl PeerConnectionManager {
             return Err(io::Error::other("session_id mismatch"));
         }
 
+        debug_record(format!(
+            "[{peer}] received ANSWER (browser offerer): {len} bytes, candidates: {summary}",
+            peer = peer_id.fmt_short(),
+            len = sdp.len(),
+            summary = summarize_sdp_candidates(sdp)
+        ));
+
         let pc_clone = peer.pc.clone();
         let sdp_owned = sdp.to_string();
         let rds = peer.remote_desc_set.clone();
         let prc = peer.pending_remote_candidates.clone();
+        let peer_short = peer_id.fmt_short().to_string();
         wasm_bindgen_futures::spawn_local(async move {
             let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
             desc.set_sdp(&sdp_owned);
@@ -587,8 +743,12 @@ impl PeerConnectionManager {
                 wasm_bindgen_futures::JsFuture::from(pc_clone.set_remote_description(&desc)).await
             {
                 warn!(?e, "set_remote_description failed for answer");
+                debug_record(format!(
+                    "[{peer_short}] setRemoteDescription(answer) FAILED: {e:?}"
+                ));
                 return;
             }
+            debug_record(format!("[{peer_short}] setRemoteDescription(answer) OK"));
 
             // Remote description is now set — flush any buffered ICE candidates.
             rds.set(true);
@@ -598,6 +758,10 @@ impl PeerConnectionManager {
                     count = buffered.len(),
                     "flushing buffered ICE candidates after setRemoteDescription (offerer)"
                 );
+                debug_record(format!(
+                    "[{peer_short}] flushing {n} buffered remote ICE candidates (offerer)",
+                    n = buffered.len()
+                ));
             }
             for (candidate, sdp_mid) in buffered {
                 let mut init = RtcIceCandidateInit::new(&candidate);
@@ -609,9 +773,17 @@ impl PeerConnectionManager {
                 )
                 .await
                 {
-                    Ok(_) => debug!(%candidate, "addIceCandidate succeeded (buffered, offerer)"),
+                    Ok(_) => {
+                        debug!(%candidate, "addIceCandidate succeeded (buffered, offerer)");
+                        debug_record(format!(
+                            "[{peer_short}] addIceCandidate OK (buffered): {candidate}"
+                        ));
+                    }
                     Err(e) => {
-                        warn!(%candidate, ?e, "addIceCandidate failed for buffered candidate")
+                        warn!(%candidate, ?e, "addIceCandidate failed for buffered candidate");
+                        debug_record(format!(
+                            "[{peer_short}] addIceCandidate FAILED (buffered): {candidate} err={e:?}"
+                        ));
                     }
                 }
             }
@@ -650,11 +822,20 @@ impl PeerConnectionManager {
                 %candidate,
                 "buffering ICE candidate (remote description not yet set)"
             );
+            debug_record(format!(
+                "[{peer}] BUFFERING remote ICE candidate (srd not done): {candidate}",
+                peer = peer_id.fmt_short()
+            ));
             peer.pending_remote_candidates
                 .borrow_mut()
                 .push((candidate.to_string(), sdp_mid.map(|s| s.to_string())));
             return Ok(());
         }
+
+        debug_record(format!(
+            "[{peer}] received remote ICE candidate: {candidate}",
+            peer = peer_id.fmt_short()
+        ));
 
         let candidate_owned = candidate.to_string();
         let mut init = RtcIceCandidateInit::new(candidate);
@@ -663,17 +844,28 @@ impl PeerConnectionManager {
         }
 
         let pc_clone = peer.pc.clone();
+        let peer_short = peer_id.fmt_short().to_string();
         wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = wasm_bindgen_futures::JsFuture::from(
+            match wasm_bindgen_futures::JsFuture::from(
                 pc_clone.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&init)),
             )
             .await
             {
-                warn!(
-                    candidate = %candidate_owned,
-                    ?e,
-                    "addIceCandidate failed"
-                );
+                Ok(_) => {
+                    debug_record(format!(
+                        "[{peer_short}] addIceCandidate OK: {candidate_owned}"
+                    ));
+                }
+                Err(e) => {
+                    warn!(
+                        candidate = %candidate_owned,
+                        ?e,
+                        "addIceCandidate failed"
+                    );
+                    debug_record(format!(
+                        "[{peer_short}] addIceCandidate FAILED: {candidate_owned} err={e:?}"
+                    ));
+                }
             }
         });
 
@@ -689,6 +881,10 @@ impl PeerConnectionManager {
                     session_id,
                     "closing WebRTC connection"
                 );
+                debug_record(format!(
+                    "[{peer}] received CLOSE signal (session={session_id})",
+                    peer = peer_id.fmt_short()
+                ));
                 self.peers.remove(&peer_id);
             }
         }
@@ -758,6 +954,10 @@ impl PeerConnectionManager {
                                 session_id = peer.session_id,
                                 "DataChannel opened"
                             );
+                            debug_record(format!(
+                                "[{peer}] DataChannel OPEN — connection is live",
+                                peer = peer_id.fmt_short()
+                            ));
                             peer.state = ConnectionState::Connected;
 
                             // On the answerer side, the DataChannel arrives via

@@ -242,3 +242,19 @@ pub fn get_addr() -> Result<String, JsValue> {
     let addr = endpoint.addr();
     serde_json::to_string(&addr).map_err(|e| JsValue::from_str(&format!("serialize: {e}")))
 }
+
+/// Returns the current WebRTC diagnostic log for copy-paste debugging.
+///
+/// Each entry is prefixed with a `Date.now()` millisecond timestamp. Covers
+/// SDP offer/answer exchange, local/remote ICE candidates, ICE state
+/// transitions, addIceCandidate failures, and DataChannel open.
+#[wasm_bindgen]
+pub fn webrtc_debug() -> String {
+    iroh::endpoint::transports::webrtc::webrtc_debug_snapshot()
+}
+
+/// Clears the WebRTC diagnostic log.
+#[wasm_bindgen]
+pub fn webrtc_debug_reset() {
+    iroh::endpoint::transports::webrtc::webrtc_debug_clear();
+}

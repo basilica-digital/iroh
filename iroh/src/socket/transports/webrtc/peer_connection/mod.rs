@@ -18,3 +18,10 @@ mod stun;
 pub(crate) use browser::PeerConnectionManager;
 #[cfg(not(wasm_browser))]
 pub(crate) use native::PeerConnectionManager;
+
+/// Copy-pasteable diagnostic log of WebRTC signaling and ICE events.
+///
+/// Intended for browser debugging where devtools are inconvenient (iOS
+/// Safari, for example). See [`browser::webrtc_debug_snapshot`] for details.
+#[cfg(wasm_browser)]
+pub use browser::{webrtc_debug_clear, webrtc_debug_snapshot};
